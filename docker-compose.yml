@@ -1,0 +1,57 @@
+# Local 4-process cluster: 1 metadata server + 3 storage nodes.
+# Each node has its own volume, so killing one really does make its chunks unreachable.
+
+services:
+  metadata:
+    build: .
+    command: uvicorn replicafs.metadata.app:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: sqlite:////data/metadata.db
+      CHUNK_SIZE: "1048576"        # 1 MB chunks so small demo files still split
+      REPLICATION_FACTOR: "3"
+      DEAD_AFTER_SECONDS: "10"
+      MONITOR_INTERVAL: "5"
+    volumes: [metadata-data:/data]
+
+  node1:
+    build: .
+    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8001
+    ports: ["8001:8001"]
+    environment:
+      NODE_ID: node1
+      NODE_URL: http://node1:8001
+      METADATA_URL: http://metadata:8000
+      DATA_DIR: /data
+    volumes: [node1-data:/data]
+    depends_on: [metadata]
+
+  node2:
+    build: .
+    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8002
+    ports: ["8002:8002"]
+    environment:
+      NODE_ID: node2
+      NODE_URL: http://node2:8002
+      METADATA_URL: http://metadata:8000
+      DATA_DIR: /data
+    volumes: [node2-data:/data]
+    depends_on: [metadata]
+
+  node3:
+    build: .
+    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8003
+    ports: ["8003:8003"]
+    environment:
+      NODE_ID: node3
+      NODE_URL: http://node3:8003
+      METADATA_URL: http://metadata:8000
+      DATA_DIR: /data
+    volumes: [node3-data:/data]
+    depends_on: [metadata]
+
+volumes:
+  metadata-data:
+  node1-data:
+  node2-data:
+  node3-data:
