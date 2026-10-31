@@ -1,112 +1,97 @@
-# 2. How it works, step by step
+# 2. How an operation works
 
-Four stories. Follow each one with the diagram from doc 1 in your head.
+The central idea is simple: the database describes complete file versions, and storage nodes hold independently verifiable pieces.
 
-## Story A — You upload a 5 MB file
+## Upload a file
 
-`curl -F file=@movie.bin localhost:8000/files`
+1. The client sends `POST /files` as a multipart form. The metadata API checks the client token when configured and validates the file name.
+2. A raw request-body guard caps incoming data at `MAX_FILE_BYTES + 64 KiB` to allow multipart framing while bounding upload handling, including requests without `Content-Length`. The API also checks the actual file content against `MAX_FILE_BYTES`, finds eligible storage nodes, and reads the file in `CHUNK_SIZE` pieces.
+3. For each piece, it creates a random chunk identifier and calculates its SHA-256 checksum. It updates the whole-file checksum at the same time.
+4. Placement considers node load and available space. The API sends bytes with an `X-Checksum` header to separate nodes, trying alternative destinations after failures.
+5. Each node verifies the incoming checksum and request size. It writes a unique temporary file, flushes data to disk, and atomically replaces the final chunk path.
+6. Successful destinations become proposed Replica records. The upload's File, Chunk, and Replica records become visible together in a database commit after all chunks meet the write policy.
+7. If storage or the final commit fails, the API rolls back the database transaction and attempts to delete chunks already written for that attempt.
 
-1. The metadata server asks its database: *which nodes are ALIVE right now?*
-   Say node1, node2, node3.
-2. It checks: *does a file called `movie.bin` already exist?* If yes, this
-   upload becomes version 2. If not, version 1.
-3. It reads the first 1 MB from the upload stream. That's **chunk 0**.
-4. It computes `sha256(chunk 0)` and generates a random id for the chunk.
-5. It picks 3 nodes — the ones currently holding the *fewest* chunks, so load
-   spreads evenly — and does `PUT http://nodeX:800X/chunks/<id>` to each one,
-   sending the bytes plus the checksum in a header.
-6. Each node recomputes the checksum on arrival. If it matches, it writes the
-   bytes to a temp file and renames it into place. (Rename is atomic on every
-   OS, so a crash mid-write never leaves a half chunk that looks real.)
-7. The metadata server remembers in memory: "chunk 0 → node1, node2, node3".
-8. Repeat from step 3 for chunks 1, 2, 3, 4.
-9. **Only now** does it write the File + Chunk + Replica rows into the database,
-   in one transaction. This is the **commit point**.
+A database transaction is an all-or-nothing group of database changes. It cannot also make independent HTTP operations transactional. Cleanup is therefore **best effort**: a disconnected node or a crash can leave unreferenced bytes. There is no automatic orphan garbage collector yet.
 
-Why step 9 matters: if anything fails at steps 3–8 (a node dies, the client
-disconnects), nothing was ever written to the database, so from the user's
-point of view the file simply doesn't exist. No half-files. The code also
-makes a best-effort attempt to delete the orphaned chunks from the nodes.
+The database enforces uniqueness of `(name, version)`. Upload serialization in one metadata process protects version allocation; this is why the supported launch commands use one worker. It is not a distributed lock across several metadata servers.
 
-What if only 2 of the 3 PUTs succeed? We accept it, log a warning, and the
-re-replicator makes the third copy in a few seconds. What if 0 succeed? The
-upload fails with HTTP 503 — we never pretend to have stored something we didn't.
+## Download a file
 
-## Story B — You download it
+1. Resolve the latest visible version, or the requested positive `version` number. Hidden/deleted versions return 404.
+2. Build an ordered read plan from its chunks and trusted live placements.
+3. Read each chunk, trying alternate replicas when a node is unreachable, reports it missing, or returns bytes with the wrong size/checksum.
+4. A definitive missing or corrupt copy is removed from the trusted map so repair can replace it. A temporary network failure is not proof that the disk copy is bad.
+5. Stage verified bytes in a temporary file on the metadata host. Confirm the total file size and checksum.
+6. Only after the file is verified does the API return a successful download response. The temporary file is closed after transmission.
 
-`curl -o copy.bin localhost:8000/files/movie.bin`
+Why stage the full download? HTTP sends the status before the body. Once `200 OK` has been sent, a later missing chunk cannot turn the response into a clean `503`. Verifying first provides a meaningful failure response, at the cost of first-byte latency, temporary disk space, and extra disk I/O.
 
-1. Find the latest non-deleted version of `movie.bin`.
-2. For each chunk in order, build a list of the replicas that are on **ALIVE** nodes.
-   If any chunk has zero live replicas → HTTP 503 right away ("chunk has no live replica").
-3. Start streaming. For chunk 0: ask the first live node. Recompute the checksum
-   on the bytes it returns.
-   - Matches → send those bytes to the client, move to chunk 1.
-   - 404 / timeout → try the next node.
-   - Checksum wrong → **this copy is corrupt.** Delete its Replica row from the
-     database, try the next node. The re-replicator will notice this chunk now
-     has 2 copies and make a new one.
-4. The client receives the chunks back-to-back, which is exactly the original file.
+This is a deliberate trade-off for this project. The application does not need to keep the whole download in RAM, but the metadata host needs space for concurrent staged files.
 
-Note the design choice: we never return bytes we haven't verified. Silent
-corruption is impossible to pass through.
+## A node stops
 
-## Story C — node2 dies
+Suppose chunk A has copies on nodes 1, 2, and 3, and node 4 is available.
 
-`docker compose kill node2`
-
-```
-t = 0 s    node2 is killed. Its heartbeat thread dies with it.
-t = 3 s    metadata server expected a heartbeat. None arrived. (Nothing happens yet —
-           maybe it's just a slow network.)
-t = 5 s    monitor thread runs: node2 last heard 5 s ago, limit is 10 s → still ALIVE.
-t = 10 s   monitor thread runs: node2 last heard 10 s ago → mark DEAD. Log a warning.
-t = 10 s   same monitor pass: scan every chunk. Any chunk whose live copies < 3?
-           Every chunk that was on node2 → yes, now 2 live copies.
-           Is there an ALIVE node that doesn't already hold it? (needs ≥ 4 nodes)
-             → tell that node: POST /replicate {chunk_id, source_url: node1, checksum}
-             → that node downloads from node1, verifies checksum, saves.
-             → add a Replica row. Chunk back to 3 live copies.
+```text
+node2 stops
+    |
+    v
+heartbeats stop
+    |
+    v
+last heartbeat becomes older than DEAD_AFTER_SECONDS
+    |
+    v
+monitor marks node2 DEAD; retained claims stop counting as live
+    |
+    v
+A has two live copies -> node4 fetches a verified copy from a survivor
+    |
+    v
+metadata records node4 -> A has three live copies again
 ```
 
-Meanwhile, any download that happens between t=0 and t=10 still works: the
-download code tries node2, gets a connection error, moves on to node1 or node3.
-The user never notices.
+Detection time is approximately the timeout plus scheduling time until the next monitor pass. Repairs then take network and disk time. These settings are not hard real-time deadlines.
 
-**Why wait 10 seconds? Why not mark DEAD after one missed heartbeat?**
-A single missed heartbeat might just be a network hiccup. If we declared death
-too eagerly, we'd start copying chunks around for nothing, and the node would
-come back 2 seconds later. The 10 s window is a trade-off: longer = fewer false
-alarms, shorter = faster recovery. HDFS uses 10 *minutes* by default.
+A download before the timeout can encounter the stopped node while it is still labelled ALIVE. It retries other listed replicas. After the timeout, new requests avoid that node's placements.
 
-## Story D — node2 comes back
+## The node returns
 
-`docker compose start node2`
+The standard storage process sends `restarted=true` on its first successful startup heartbeat; failed registration attempts keep that flag for retries. An existing node becomes **RECOVERING** on this signal, even if it restarts before the heartbeat timeout. A previously DEAD node also enters RECOVERING when heartbeats resume. A brand-new node starts ALIVE because it has no old claims. The database retains an existing node's old placement claims, but they do not count as live during recovery. The monitor fetches those chunks and compares their bytes with the recorded size and checksum. Verified claims can be trusted after recovery completes; missing/corrupt claims are removed. Temporary network failures leave recovery pending for a later pass.
 
-1. Its heartbeat thread starts, posts to the metadata server.
-2. Metadata server: "node2 was DEAD, now ALIVE" — flips the status.
-3. Its old Replica rows were never deleted, so the chunks it still has on disk
-   instantly count as live copies again. Some chunks may now have 4 copies.
-   That's harmless (just wasted disk) and cleaning it up is on the roadmap.
+This handles both a wiped disk and an ordinary restart with intact data. It also supports recovery after all storage nodes have been unavailable: surviving bytes can be validated instead of losing their map. Arbitrary orphan files without retained metadata claims are not automatically inventoried.
 
-What if node2's disk was wiped while it was down? Then its Replica rows are
-lies — the metadata thinks node2 has chunks it doesn't. Today the download code
-handles this gracefully (gets 404, tries the next node). The proper fix —
-verifying a returning node's chunks before trusting it — is a planned next step
-and a great thing to mention in an interview as "a limitation I'm aware of".
+A registered node address is immutable: changing `NODE_URL` for the same `NODE_ID` returns 409. A new address needs a new node identity; it does not automatically adopt the old identity's claims. Use a stable DNS name/address across restarts. Never run two different storage nodes with the same `NODE_ID`.
 
-## The database, in plain words
+## A disk silently changes bytes
 
-Four tables:
+Reads compare SHA-256 and expected size with the metadata record. Periodic integrity checking also examines replicas even when no client downloads the file. Bad or missing placements are dropped; the repair loop copies from a healthy source.
 
-```
-nodes     one row per storage node: id, url, ALIVE/DEAD, last heartbeat time
-files     one row per (name, version): size, whole-file checksum, deleted_at
-chunks    one row per chunk: which file, position (0,1,2…), size, checksum
-replicas  one row per (chunk, node) pair: "this chunk lives on this node"
+The integrity scan is bounded per pass so it does not read every stored byte on every monitor tick. Detection is eventual. Large clusters need indexed repair work queues and more advanced scanning policies.
+
+## Delete, overwrite, restore
+
+```text
+upload notes.txt -> version 1
+upload notes.txt -> version 2
+GET notes.txt -> version 2
+GET notes.txt?version=1 -> version 1
+DELETE notes.txt -> both visible versions become hidden
+POST notes.txt/restore -> deleted versions become visible again
 ```
 
-Everything the system knows is in those four tables. The file *bytes* are only
-on the nodes' disks.
+Version history remains inspectable while the file is soft-deleted. Restore restores all deleted versions under the name; it is not a “make version 1 the new latest” operation. To create a new latest copy of version 1, download it and upload its bytes again.
 
-Next: [03-code-walkthrough.md](03-code-walkthrough.md) — the actual code, file by file.
+If a new version is uploaded after deletion, its version number continues increasing. Restoration makes older deleted versions visible alongside it; the highest visible version remains the default download.
+
+## What the tables mean
+
+| Table | A row means |
+|---|---|
+| `nodes` | “This node has this address and heartbeat state.” |
+| `files` | “This name has this version, size, checksum, and deletion state.” |
+| `chunks` | “This piece belongs at this position in this file version.” |
+| `replicas` | “This chunk has a trusted stored copy on this node.” |
+
+Next: [find these decisions in the code](03-code-walkthrough.md).

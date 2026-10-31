@@ -1,132 +1,63 @@
-# 4. Questions you will be asked
+# 4. Explain your choices in an interview
 
-Practice saying these answers out loud. Interviewers care less about the exact
-words and more about whether you *understand the trade-off*.
+Use these as prompts. Reproduce the behavior and understand the source before using a claim on your resume.
 
----
+## “Explain it in thirty seconds.”
 
-**Q: Explain the project in 30 seconds.**
+“ReplicaFS is a Python backend that splits uploaded files into chunks and keeps copies on different storage nodes. A metadata API tracks the file versions and chunk locations. Nodes report heartbeats; a background monitor detects unavailable nodes and recreates missing copies from healthy ones. SHA-256 detects bad data, and versioning with soft delete helps recover mistakes. I can demonstrate node failure and verify that downloaded bytes still match.”
 
-It's a small distributed file system. Files are cut into chunks, each chunk is
-stored on three separate nodes, and a central metadata server tracks where each
-chunk lives. Nodes send heartbeats; if one goes silent it's marked dead, reads
-automatically fall back to the other copies, and a background job re-replicates
-the lost chunks onto healthy nodes. Checksums catch corrupted data and soft
-delete with versioning lets users undo mistakes. It's the same architecture as
-GFS and HDFS, at a size you can read in an afternoon.
+## “Is this another S3?”
 
----
+It is an educational distributed-storage implementation with a small feature set. It has no S3 compatibility claim, multi-tenant authorization, production durability target, or metadata high availability. Comparing its architecture and failure handling is useful; claiming equivalent reliability is unsupported.
 
-**Q: Why split into chunks instead of storing whole files?**
+## “What is the difference between replication and backup?”
 
-Three reasons: (1) a chunk is small enough to re-copy quickly when a node dies —
-re-replicating 4 MB is fast, 4 GB is not; (2) chunks of one file spread across
-nodes, so reads and writes are parallelisable and no single node is a hotspot;
-(3) memory — we only ever hold one chunk in RAM, so file size doesn't matter.
+Replication keeps extra copies for availability after failures. Those copies may share an operator mistake or a faulty software change. A backup is a separately recoverable snapshot with its own retention and restore procedure. ReplicaFS still needs metadata and chunk backups.
 
----
+## “Why not put three copies in the same directory?”
 
-**Q: Why 3 replicas? Why not 2 or 5?**
+One disk or host failure can remove all three. Independent node IDs are a software placement rule. Independent machines, disks, power, and networks are physical failure domains; deployment determines whether they are actually independent.
 
-It's a cost/safety dial. 2 copies means one failure leaves you with zero
-redundancy while re-replication runs — a second failure in that window loses
-data. 3 copies survives two simultaneous failures. 5 costs 67% more disk for
-protection against a scenario that's rare. 3 is the industry default (HDFS,
-Cassandra, GFS) for exactly this reason. It's a config variable in my system.
+## “How do you know a node died?”
 
----
+I do not know its physical state. I suspect unavailability after heartbeat silence crosses a threshold. That can also be a partition or a slow node. Timeout and monitor interval balance detection delay against false alarms.
 
-**Q: How do you detect that a node has failed?**
+## “Can you tolerate two failed nodes?”
 
-Heartbeats. Every node POSTs "I'm alive" every 3 seconds. A monitor thread on
-the metadata server marks a node DEAD if its last heartbeat is older than 10
-seconds. The node doesn't announce its death — it *can't* — so the absence of
-heartbeats is the signal.
+For a chunk with three healthy copies on separate failed-independent nodes, two holder failures can leave a readable copy. That statement depends on full replication, reachability, valid bytes, and a working metadata server. Degraded writes have weaker protection. Losing all usable copies cannot be healed.
 
----
+## “Why a spare node?”
 
-**Q: Why 10 seconds? What if you made it 1 second?**
+After one of three holders fails, three-copy redundancy needs a fourth destination. A three-node cluster can remain readable after a failure but cannot return to three live copies while that holder stays down.
 
-A short timeout means faster recovery but more false positives: a GC pause or
-a network blip would trigger needless re-replication, and then the node comes
-back and you have 4 copies to clean up. A long timeout means fewer false alarms
-but a longer window with reduced redundancy. 10 s was reasonable for a LAN;
-HDFS defaults to 10 minutes because re-replicating a whole DataNode is expensive.
+## “Why checksum every read?”
 
----
+A successful disk or HTTP read can still return incorrect bytes. Comparing with the expected SHA-256 detects accidental corruption. A surviving good copy enables recovery. A checksum is not encryption or authentication.
 
-**Q: What happens if a node dies in the middle of an upload?**
+## “What happens to a half-finished upload?”
 
-The PUT to that node fails. If at least one other node accepted the chunk, I
-log a warning and continue — the re-replicator will add the missing copy within
-seconds. If *no* node accepted it, the upload returns 503. In either case the
-database is only written after every chunk is stored, so a failed upload leaves
-no half-file visible to the user. I also best-effort delete any chunks that did
-land, so they don't become orphans.
+The metadata commit happens after storage work meets the write policy. If the attempt fails, metadata rolls back and cleanup attempts to remove written chunks. Crashing or losing network access can leave orphan bytes because one SQL transaction cannot atomically cover independent remote disks. An orphan collector is a future improvement.
 
----
+## “Why stage the download?”
 
-**Q: What happens if the metadata server dies?**
+A streamed response sends its status first. If a later chunk is unavailable, the API cannot replace an already-sent success status with a clean error. Staging and verifying the file before success gives a reliable error response, using temporary disk space and delaying the first byte.
 
-Everything stops — no uploads or downloads — but no data is lost, because the
-chunks are still on the nodes and the metadata is in a database on disk.
-Restart it and it carries on. That's the main limitation: it's a single point of
-availability, the same as the original GFS master and HDFS NameNode before HA
-was added. The fix would be a standby metadata server with a replicated database,
-which is on my roadmap.
+## “What if a node returns with a wiped disk?”
 
----
+Timeout detection makes its retained placement claims untrusted. A returning heartbeat sets RECOVERING; the standard node also sends a startup flag so even a fast restart triggers checking. The monitor checks those claims against bytes on disk before allowing ALIVE. Missing/corrupt claims are removed. Valid disks can also recover after a full storage outage. Arbitrary orphan bytes without metadata are not automatically recovered.
 
-**Q: How do you know a chunk hasn't been corrupted on disk?**
+## “How do simultaneous uploads get different versions?”
 
-Every chunk's SHA-256 is recorded at upload. On every read, the node reports the
-checksum of what's on disk now, and the metadata server also recomputes it over
-the bytes it received. Mismatch → that replica is removed from the index, the
-read falls back to another copy, and the re-replicator creates a fresh copy from
-a verified source. Corrupt bytes are never returned to the client.
+The metadata process serializes the relevant mutation and the database also has a uniqueness constraint. One worker is the supported configuration. Multiple independent coordinators would need a database-backed allocation/locking strategy and a coordinated background repair owner.
 
----
+## “What if the metadata server fails?”
 
-**Q: A node comes back after being dead. What state is it in?**
+It is a single point of failure. Persisted metadata survives an ordinary process restart, but the API is unavailable until restart. Losing its disk needs a backup restore. A production design would need replicated metadata, leader coordination, and tested failover; adding another API process is insufficient.
 
-Its old replica records were never deleted, so if its disk is intact, its chunks
-immediately count as live copies again — possibly giving some chunks 4 copies,
-which is harmless. If its disk was wiped, those records are stale; reads handle
-that (404 → next replica), but the honest answer is that I should verify a
-returning node's chunk list before trusting it. That's a known gap.
+## “What would you improve first?”
 
----
+Choose based on evidence: orphan and retention garbage collection for storage growth; indexed repair queues for scale; per-user ownership for a shared service; metadata replication for availability; or parallel transfers with bounded concurrency for throughput. Explain the extra failure cases each introduces.
 
-**Q: How does the system pick which nodes get a chunk?**
+## “How did you test it?”
 
-Least-loaded first — sort alive nodes by chunk count, take the top 3. I also
-increment the count in memory during an upload so consecutive chunks of the same
-file spread across nodes rather than all landing on the same three. Real systems
-add rack awareness (don't put all 3 copies in one rack) and free-disk checks.
-
----
-
-**Q: What's the biggest thing you'd change for production?**
-
-Metadata server HA, and replacing the re-replicator's full chunk scan with an
-index by node so a dead node's chunks are found in O(its chunks) rather than
-O(all chunks). Also garbage collection — soft-deleted files currently hold their
-chunks forever.
-
----
-
-**Q: How did you test it?**
-
-Unit tests for the pure functions, and an end-to-end suite that starts a real
-5-process cluster, kills a node, corrupts a chunk on disk, and asserts the
-downloads still match byte-for-byte and the cluster returns to full replication.
-Plus a shell demo against the Docker stack that does the same thing visibly.
-
----
-
-**Q: Why FastAPI / Python? Isn't that slow for a storage system?**
-
-For a learning-scale system the bottleneck is disk and network, not Python.
-FastAPI gave me streaming uploads/downloads and automatic API docs for free.
-If throughput mattered I'd move the storage node to Go or Rust first, because
-it's the dumbest component and the one that moves the most bytes.
+Describe concrete evidence: isolated request and disk-error tests, checksum and path validation, repair retries, and real-process integration tests that stop nodes and compare downloaded bytes. Then show the test guide and actual output. Do not invent throughput numbers, uptime percentages, or a cloud deployment you have not run.

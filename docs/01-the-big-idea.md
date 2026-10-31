@@ -1,114 +1,63 @@
 # 1. The big idea
 
-## The problem in one sentence
+## The problem
 
-If you save a file on one computer and that computer dies, the file is gone.
+A file on one disk has one place to fail. If that disk is unavailable, downloads stop. If its bytes are destroyed and there is no other copy or backup, the file is lost.
 
-That's it. Everything in this project exists to solve that one sentence.
+ReplicaFS teaches how to spread that risk. It stores multiple copies of each file piece, notices missing nodes, and makes replacement copies from surviving data.
 
-## The obvious fix, and why it's not enough
+## Why split a file?
 
-"Just keep a copy on a second computer."
+A chunk is a numbered piece. With 1 MiB chunks, a file containing 2 MiB plus seven bytes has three chunks: two full chunks and one seven-byte tail. Downloads join the pieces in the same order.
 
-Good instinct — that's exactly what we do. But the moment you have more than
-one computer, new questions appear that a single-computer program never has to answer:
+Copying a chunk is easier than replacing an entire large file. Chunks can be placed across different nodes. The code moves one chunk at a time, which limits application memory compared with loading a whole file. HTTP libraries, multipart upload handling, concurrent requests, and temporary buffering also consume resources; chunk size is not a total process memory guarantee.
 
-1. **Which computer has my file?** You need a list somewhere.
-2. **How do I know a computer is dead?** It can't tell you — it's dead.
-3. **When one dies, who makes a new copy?** Otherwise you slowly lose all your copies.
-4. **What if a copy got silently damaged?** A bad disk can flip bits without any error.
-5. **What if I delete something by mistake?** With copies everywhere, "undo" is harder.
+## Why three copies?
 
-ReplicaFS is a small, readable answer to all five. Google (GFS), Hadoop (HDFS),
-and Amazon (S3) answer the same five questions at planet scale. The ideas are
-identical; only the size differs.
+The replication factor is the desired number of separate node copies of each chunk. Three is a useful learning default: one lost replica can be replaced using another. At full three-copy replication, a chunk can remain readable after two of its holders fail, provided a valid reachable copy remains.
 
-## The five ideas (memorize these)
+The guarantee is per chunk. Two nodes failing can affect different chunks differently. An upload made with fewer successful copies has less protection. A network partition can make a surviving copy temporarily unreachable. Read the actual write policy in the API reference.
 
-### Idea 1 — Chunking: cut the file into pieces
+Three copies take roughly three times the file bytes in storage, before old versions, metadata, temporary files, and abandoned chunks. That is the price paid for redundancy.
 
-A 1 GB file is not stored as one blob. It's cut into fixed-size pieces (we use
-4 MB; the demo uses 1 MB so small files still split). Each piece is called a **chunk**.
+## Why four nodes in the example?
 
-Why bother?
-- A chunk is small enough to copy around quickly when a node dies.
-- Different chunks of one file can live on different computers, spreading the load.
-- You never need 1 GB of RAM to handle a 1 GB file — just one chunk at a time.
+Imagine chunk A lives on nodes 1, 2, and 3. Node 2 stops. Nodes 1 and 3 still serve A, but only two copies remain. Node 4 can receive a replacement while node 2 is still unavailable.
 
-### Idea 2 — Replication: keep 3 copies of every chunk
+With only three nodes and a target of three, there is no fourth destination. Downloads can still work, but full redundancy cannot be restored until another healthy destination exists.
 
-Every chunk is written to **3 different computers**. The number 3 is called the
-**replication factor**. With 3 copies, two computers can die at the same time
-and you still have your data. (HDFS also defaults to 3. Not a coincidence.)
+## What does the metadata server do?
 
-### Idea 3 — Metadata server: one brain that knows where everything is
+It stores a map:
 
-The computers that hold chunks are called **storage nodes**. They are
-deliberately dumb: "store these bytes under this id", "give me the bytes for
-this id". They don't know what a *file* is.
-
-One separate program, the **metadata server**, keeps the map:
-
-```
-file "photo.jpg" version 1
-  chunk 0  →  on node1, node2, node3
-  chunk 1  →  on node1, node3, node4
-  chunk 2  →  on node2, node3, node4
+```text
+notes.txt, version 1
+  chunk 0: checksum ..., copies on nodes 1, 2, 4
+  chunk 1: checksum ..., copies on nodes 1, 3, 4
 ```
 
-"Metadata" just means "data about the data" — names, sizes, locations — but
-never the file contents themselves. GFS calls this the *master*, HDFS calls it
-the *NameNode*. Same thing.
+The database contains this map, names, sizes, times, and version numbers. The storage nodes contain the chunk bytes. The metadata server also transfers file bytes during requests, so it is both the coordinator and the data gateway. It needs disk space for upload handling and verified download staging.
 
-### Idea 4 — Heartbeats: silence means death
+Losing the metadata database is serious even if many chunks survive: the system loses its supported way to identify their names and order. Protect the map as well as the contents.
 
-Every storage node sends a tiny HTTP message to the metadata server every 3
-seconds: "I'm node2, I'm alive, I hold 17 chunks." That message is a **heartbeat**.
+## How does it detect failure?
 
-If the metadata server hasn't heard from node2 for 10 seconds, it marks node2
-**DEAD** and stops sending it reads or writes. Nobody told it node2 died. The
-*absence* of heartbeats is the signal. This is how almost every distributed
-system detects failure.
+Nodes send heartbeats. The metadata server compares the last heartbeat time with a timeout. Silence beyond that timeout means the node is considered unavailable.
 
-### Idea 5 — Self-healing: a background loop that fixes the copy count
+This is a suspicion, not a physical diagnosis. The cause could be a stopped process, an unplugged network, a slow machine, or a broken route. “DEAD” is the program's health label. The program cannot know which cause occurred from silence alone.
 
-When node2 dies, every chunk that was on node2 now has only 2 live copies
-instead of 3. A background thread in the metadata server (the **re-replicator**)
-constantly asks: "Does any chunk have fewer than 3 live copies?" If yes, it tells
-a healthy node: "Go fetch chunk X from node1 and keep a copy."
+A shorter timeout detects failures faster but can trigger unnecessary repairs during brief network problems. A longer timeout delays repair but avoids some false alarms.
 
-Without this, every failure permanently reduces your safety margin. With it, the
-cluster drifts back to full strength on its own.
+## How does it heal?
 
-## Two bonus ideas
+A background monitor counts trusted live copies of each chunk. When the count is below the target and at least one valid source remains, it asks another node to fetch and save that chunk. The target verifies the bytes before the metadata server records the new copy.
 
-**Checksums.** When a chunk is uploaded we compute its SHA-256 hash (a 64-char
-fingerprint) and store it in the metadata. Every time we read a chunk back we
-recompute the hash. If it doesn't match, the bytes changed on disk — we throw
-that copy away, read from another copy, and let the re-replicator make a fresh one.
+If every usable copy is gone, copying cannot invent the lost bytes. `unavailable_chunks` exposes that situation. Backups and independent failure domains remain necessary.
 
-**Soft delete + versions.** Deleting a file only sets a `deleted_at` timestamp;
-nothing is physically removed, so `restore` is just clearing that timestamp.
-Uploading a name that already exists creates version 2; version 1 stays
-downloadable. So "I accidentally overwrote it" is also recoverable.
+## Why hashes and versions?
 
-## Picture to keep in your head
+SHA-256 produces a fingerprint from bytes. Comparing a stored fingerprint with a newly calculated one detects accidental changes with extremely high confidence. A checksum does not fix bytes by itself; another good replica supplies the replacement. It also is not encryption or proof that the original uploader was trustworthy.
 
-```
-                      you (curl / browser / app)
-                               │
-                               │  upload / download / list / delete
-                               ▼
-                     ┌───────────────────┐
-                     │  metadata server  │   knows WHERE everything is
-                     │  (the brain)      │   never holds file bytes
-                     └───────────────────┘
-                        ▲    │     ▲
-            heartbeats  │    │     │  "store / give me chunk <id>"
-            every 3 s   │    ▼     ▼
-              ┌──────┐  ┌──────┐  ┌──────┐
-              │node1 │  │node2 │  │node3 │   dumb boxes full of chunks
-              └──────┘  └──────┘  └──────┘
-```
+Versions preserve earlier uploads under the same name. Soft delete marks records as hidden without erasing their chunks. These features help recover from accidental overwrites and deletes, but retained versions use disk until a future retention/garbage-collection feature removes them.
 
-Next: [02-how-it-works.md](02-how-it-works.md) — what actually happens, step by step.
+Next: [follow the operations step by step](02-how-it-works.md).

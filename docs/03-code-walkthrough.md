@@ -1,174 +1,94 @@
-# 3. Code walkthrough
+# 3. Read the code with a map
 
-About 450 lines of Python total. Open each file as you read.
+Read the small helpers first, then the storage server, database, repair loop, and metadata API. Function names are useful search terms: use your editor's “find in files” to locate them.
 
-```
-replicafs/
-  common.py                ← 30 lines: hashing, chunk iteration, node picking
-  storage/app.py           ← ~130 lines: the dumb box
-  metadata/db.py           ← ~80 lines: the four tables
-  metadata/replicator.py   ← ~70 lines: failure detection + self-healing
-  metadata/app.py          ← ~250 lines: the REST API
-```
+## Shared helpers: `replicafs/common.py`
 
----
+`sha256_hex` turns bytes into a hexadecimal SHA-256 fingerprint.
 
-## `replicafs/common.py`
+`iter_chunks` is a generator: it reads a bounded slice and yields the chunk number plus bytes, then continues when the caller asks for the next one. Empty input produces no chunks. Nonpositive chunk sizes are invalid; zero must not silently turn a nonempty file into an empty one.
 
-Three tiny functions used by both services.
+`pick_nodes` handles placement ordering. Counting chunks is an understandable approximation of load. It is not byte-perfect space accounting and does not model racks, geography, latency, or concurrent reservations.
 
-**`sha256_hex(data)`** — the checksum. SHA-256 turns any bytes into a 64-character
-hex string. Change one bit of input → completely different output. That's why it
-detects corruption.
+## Authentication: `replicafs/security.py`
 
-**`iter_chunks(fileobj, chunk_size)`** — a generator. Reads `chunk_size` bytes,
-yields `(index, bytes)`, repeats until the file is empty. Because it's a generator,
-only one chunk is in memory at a time. A 10 GB upload uses ~4 MB of RAM.
+There are two different secrets:
 
-**`pick_nodes(nodes, k)`** — sort nodes by how many chunks they hold, take the first
-`k`. Least-loaded first. This is the entire "placement policy". Real systems add
-rack awareness, disk space, etc. — same idea, more inputs.
+- `API_TOKEN` protects client file operations and administration requests.
+- `CLUSTER_TOKEN` protects internal heartbeats and storage operations. Metadata and storage processes share it.
 
----
+Requests use `Authorization: Bearer <token>`. `cluster_headers` supplies that header for internal HTTP calls. Token checks use constant-time comparison to avoid an ordinary string comparison revealing information through timing. Empty tokens disable that check for local learning. This is a shared-secret design, not user accounts or file ownership.
 
-## `replicafs/storage/app.py` — the storage node
+Most process configuration is read during import/startup. Apply environment changes by restarting the affected processes; use the same internal token across the cluster.
 
-Config comes from environment variables (`NODE_ID`, `NODE_URL`, `METADATA_URL`,
-`DATA_DIR`). The same code runs as node1, node2, node3 with different env vars.
+## Storage: `replicafs/storage/app.py`
 
-**`chunk_path(chunk_id)`** — maps an id to a file on disk. The `isalnum()` check
-is a security guard: without it someone could request `../../etc/passwd`.
+A storage node understands chunk IDs and bytes. It does not assign file versions or decide how many copies are needed.
 
-**`write_chunk_atomically(path, data)`** — write to `path.tmp`, then
-`os.replace(tmp, path)`. The rename is atomic: readers see either no file or the
-complete file, never a partial one. This is a classic pattern you'll see in
-databases, package managers, everywhere.
+`chunk_path` validates an identifier before converting it into a filesystem path. A client must not be able to turn an ID into `../another-directory`. Length and ASCII checks keep the accepted identifier format small and predictable.
 
-**`heartbeat_loop()`** — runs in a background thread started in `lifespan`.
-Infinite loop: POST to `/nodes/heartbeat`, sleep 3 s. Wrapped in `try/except`
-so a dead metadata server doesn't crash the node — it just keeps trying.
+`write_chunk_atomically` creates a unique temporary file in the destination directory, writes and flushes bytes, then uses replacement to publish the completed chunk. Unique temporary names prevent simultaneous writes from sharing one `.tmp` file. Cleanup removes an unsuccessful temporary write. Flushing and atomic replacement address particular failure windows; they are not a guarantee against every disk/controller or power failure.
 
-**Endpoints:**
-- `PUT /chunks/{id}` — receive bytes, verify the `X-Checksum` header matches, write atomically.
-- `GET /chunks/{id}` — read bytes, return them with a freshly computed `X-Checksum`.
-- `DELETE /chunks/{id}` — remove (used for cleanup after a failed upload).
-- `POST /replicate` — "go download chunk X from node Y and keep it." Verifies the
-  checksum before saving, so a corrupt source can't spread.
+`local_chunk_count` counts actual chunk files while excluding temporary files and directories. Heartbeats report this count and available filesystem bytes.
 
-Notice how little this file knows. No concept of files, versions, or other nodes'
-health. That's deliberate — dumb nodes are easy to add, replace, and reason about.
+`PUT /chunks/{id}` bounds and validates bytes before saving. `GET` returns bytes plus their current checksum. `DELETE` supports cleanup after failed uploads. `/replicate` asks this node to fetch a chunk from another node, check it, and publish it locally.
 
----
+The lifespan function starts the heartbeat worker. An event lets shutdown stop it rather than leaving an endless worker behind. HTTP errors are checked, so a rejected heartbeat is not treated as a successful registration. Startup heartbeats include `restarted=true` until one registration succeeds; later heartbeats send false. This lets metadata verify a fast-restarting existing node before trusting its old disk claims.
 
-## `replicafs/metadata/db.py` — the four tables
+## Database: `replicafs/metadata/db.py`
 
-SQLAlchemy models. The relationship chain:
+SQLAlchemy maps Python classes to tables. A `Session` tracks changes and sends them to the database. `commit` saves the transaction; `rollback` abandons it; closing the session frees its resources.
 
-```python
-File.chunks      → list of Chunk, ordered by index
-Chunk.replicas   → list of Replica
-Replica.node     → Node
+The relationships follow:
+
+```text
+File.chunks -> ordered Chunk rows
+Chunk.replicas -> Replica rows
+Replica.node -> one Node row
 ```
 
-Things worth noticing:
-- `UniqueConstraint("name", "version")` — you can't have two "photo.jpg v2".
-- `File.deleted_at` is nullable — `NULL` means "not deleted". That's the whole
-  soft-delete mechanism.
-- `Replica` has a composite primary key `(chunk_id, node_id)` — a chunk can't be
-  recorded twice on the same node.
-- `utcnow()` returns a *naive* UTC datetime so the comparison in `mark_dead_nodes`
-  behaves identically on SQLite and Postgres.
-- `DATABASE_URL` defaults to SQLite. Set it to `postgresql://...` and nothing else changes.
+The `(name, version)` constraint prevents duplicate version records. The `(chunk_id, node_id)` primary key prevents counting one node twice for the same chunk. Foreign keys connect related records. Size fields represent bytes; checksum fields describe expected content.
 
----
+SQLite is the supported default and makes setup simple. Another SQLAlchemy database URL alone is not proof of support: it needs a suitable driver, migrations, deployment configuration, and its own integration validation.
 
-## `replicafs/metadata/replicator.py` — the self-healing loop
+Each node also has a recovery generation: a counter increased when it restarts.
+An integrity pass remembers that counter and can approve the node only if the
+counter still matches. Otherwise a second restart could lose the disk while an
+older check was still running. Startup applies the small additive column/index
+upgrades to existing SQLite databases without deleting their file records.
 
-**`mark_dead_nodes(db, dead_after_seconds)`** — one SQL query:
-`status == ALIVE AND last_heartbeat < now - 10s` → set DEAD. Returns how many flipped.
+## Recovery: `replicafs/metadata/replicator.py`
 
-**`under_replicated_chunks(db, rf)`** — for every chunk, count replicas whose node
-is ALIVE. Yield the chunk if `0 < count < rf`.
+`mark_dead_nodes` compares heartbeat times with a cutoff and marks stale nodes DEAD. Their retained claims stop counting as live copies. A returning heartbeat, or the `restarted=true` startup signal on an existing node, moves it to RECOVERING; retained claims must be checked against disk before it becomes ALIVE. This prevents a blank disk from restoring fictional copies while preserving the ability to recover intact disks after a full outage.
 
-Why `0 <`? If a chunk has **zero** live copies, there's nothing to copy *from*.
-We can't fix it; we can only wait for a node to come back. Yielding it would
-make the re-replicator try and fail forever.
+`under_replicated_chunks` finds chunks with surviving sources but insufficient copies. `replication_health` also counts completely unavailable chunks for monitoring; an unavailable chunk must not disappear from the health picture just because it cannot currently be copied.
 
-**`re_replicate(db, client, rf)`** — for each under-replicated chunk:
-1. source = any ALIVE node that has it
-2. targets = ALIVE nodes that *don't* have it, least-loaded first, take `rf - live` of them
-3. POST `/replicate` to each target
-4. on success, insert a Replica row and bump the target's chunk count
+`re_replicate` chooses destinations that do not already hold the chunk. It retries sources and targets on failure, supplies the cluster token, and records a placement only after a valid destination response. Capacity `-1` means unknown, `0` means full, and positive reports constrain placement. It must not count an HTTP error or malformed acknowledgement as a stored copy.
 
-The comment "full scan is fine at this scale" is honest: with a million chunks
-you'd index replicas by node and only rescan the dead node's chunks. Know this
-for interviews.
+`verify_replicas` checks a bounded batch for actual size and checksum. Definitive 404/corruption removes a placement; a timeout alone does not prove the bytes are damaged. Batches rotate so an unchanged early part of the table does not permanently starve later replicas.
 
----
+## Metadata API: `replicafs/metadata/app.py`
 
-## `replicafs/metadata/app.py` — the API
+`get_db` gives each request its own database session and closes it afterward. Request handlers perform blocking database and HTTP work in ordinary `def` handlers, which FastAPI runs in a thread pool.
 
-**Startup (`lifespan`)** — create tables, start `monitor_loop` in a daemon thread.
-The loop calls `mark_dead_nodes` then `re_replicate` every `MONITOR_INTERVAL` seconds.
+Startup initializes the schema and monitor; shutdown signals the monitor to stop and closes network resources. The monitor performs health detection, bounded integrity checks, and repair. Exceptions are logged and the loop continues; a transient error should not permanently stop self-healing.
 
-**`client = httpx.Client()`** at module level — one shared HTTP client with
-connection pooling, used by both request handlers and the monitor thread.
+The raw request-body guard limits incoming metadata requests to `MAX_FILE_BYTES + 64 KiB`, including streamed requests without `Content-Length`, before multipart processing can spool unlimited data. The upload handler then checks the file-content limit, write policy, node selection, cleanup list, version allocation, and final commit. `attempted` keeps enough information to attempt deleting bytes from an abandoned write, including a write whose acknowledgement was lost. It cannot undo a remote write on a currently unreachable node.
 
-### Node endpoints
-- `POST /nodes/heartbeat` — upsert the Node row, set ALIVE, update `last_heartbeat`.
-  The "node is back ALIVE" log line is how you'd notice recovery in production logs.
-- `GET /nodes` — list with status.
-- `GET /cluster` — counts. `under_replicated_chunks` here reuses the exact same
-  generator the re-replicator uses, so the number you see is the number it will fix.
+The download handler resolves a version and creates a plain read plan. It verifies and stages bytes before returning the response. Do not leave lazy SQLAlchemy relationships inside a generator that outlives its database session. `read_chunk` handles retry and verification; the replica-removal helper makes corrupt/missing copies eligible for repair.
 
-### `POST /files` — upload (read this one slowly)
+Deletion and restoration update timestamps on metadata records. They do not erase the stored chunk bytes.
 
-Follow Story A from doc 2 against the code. Key lines:
+## Supporting files
 
-- `record = File(..., version=(prev.version + 1) if prev else 1)` — versioning is one line.
-- `written: list[tuple[str, str]]` — every successful PUT is remembered so we can
-  clean up if we abort.
-- `node.chunk_count += 1` inside the loop — this is why `pick_nodes` spreads
-  chunks across >3 nodes *within* one upload, not just between uploads.
-- The `except Exception:` block deletes orphans then **re-raises**. We don't
-  swallow the error; the client gets a 503 and the database is untouched.
-- `db.add(record); db.commit()` is the **last** thing. That's the commit point.
+| File | Why it exists |
+|---|---|
+| `docker-compose.yml` | Describes the local five-process cluster and its separate persistent volumes. |
+| `Dockerfile` | Packages both APIs in one reusable, non-root container image. |
+| `.env.example` | Lists local token settings without storing real secrets. |
+| `scripts/dev_cluster.py` | Starts/stops a native cluster and keeps per-service logs. |
+| `scripts/demo_failover.sh` | Gives a repeatable, byte-checked node-failure demonstration. |
+| `tests/` | Encodes expected behavior and failures as automated checks. |
+| `.github/workflows/` | Runs the repository's checks on changes in GitHub Actions. |
 
-Note the endpoint is `def`, not `async def`. FastAPI runs it in a thread pool,
-which is right for code that does blocking I/O (SQLAlchemy, synchronous httpx).
-
-### `GET /files/{name}` — download
-
-- Builds `plan`, a plain list of `(chunk_id, checksum, [live urls])`, **before**
-  returning. The streaming generator must not touch the database session, because
-  that session is closed once the function returns. Pre-computing the plan avoids
-  a whole class of "session is closed" bugs.
-- `StreamingResponse(stream(), ...)` sends chunks as they're fetched — the client
-  starts receiving before the last chunk is read.
-- `read_chunk` is the failover logic from Story B. `forget_replica` is what
-  removes a corrupt copy from the index.
-
-### Delete / restore / versions
-
-Tiny. `soft_delete` sets `deleted_at` on every version of the name.
-`restore` sets them back to `NULL`. `versions` lists all rows for a name.
-
----
-
-## `tests/test_e2e.py` — the proof
-
-The `Cluster` class starts one metadata server and four storage nodes as real
-subprocesses on random free ports, with timeouts shortened (heartbeat 1 s, dead
-after 3 s) so the test finishes in ~15 s.
-
-Four tests, each a scenario from doc 2:
-1. upload → 4 chunks, 12 replicas, bytes round-trip
-2. kill a node → download still correct → wait until 0 under-replicated → node returns
-3. corrupt a chunk file on disk → download still correct → replica count back to 6
-4. two versions, download each, delete, 404, restore, download again
-
-Why 4 nodes in the test but 3 in Docker? With rf = 3 and 3 nodes, when one dies
-there's nowhere to put a third copy. The 4th node is the "spare" that lets the
-test prove re-replication actually copies bytes.
-
-Next: [04-interview-questions.md](04-interview-questions.md)
+Next: [practice the APIs](05-try-it-yourself.md), then [read the test strategy](07-testing.md).

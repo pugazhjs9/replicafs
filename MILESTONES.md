@@ -51,3 +51,25 @@ The repository starts with five helper tests and four real-process system tests.
 The first sandboxed run passed the five helper tests; starting local TCP servers
 required execution outside the filesystem/network sandbox. Final measured
 results belong in the testing guide after implementation and verification.
+
+## Completed implementation history
+
+| Commit | Milestone delivered |
+| --- | --- |
+| `937c5c8` | Acceptance plan and honest project scope. |
+| `ed76135` | Shared validation, authenticated internal/client requests, SQLite safety. |
+| `07103a5` | Bounded durable chunk storage and filesystem/API regressions. |
+| `7a8d88e` | Retained untrusted claims, verified recovery, capacity-aware repair and integrity scans. |
+| `b4ecbab` | Atomic file visibility, concurrent versions, verified downloads, limits and metrics. |
+| `d4c1490` | Fast-restart notifications, finite configuration, private internal HTTP traffic. |
+| `29692e6` | Authenticated real-process fault and edge-case acceptance tests. |
+| `1485bf2` | Dependency snapshot, lint/coverage/security checks, Python matrix and Docker CI. |
+| `3a10170` | Four-node Docker deployment, native launcher and byte-checked failover demo. |
+| `3631714` | Lifecycle and non-destructive legacy SQLite migration tests. |
+| `cde3c7a` | Supervised Linux metadata/storage services with private-network settings. |
+| `4d206e3` | Recovery generation guard: stale checks cannot approve a newer restart. |
+
+The remaining documentation commits provide the beginner lessons and measured
+verification record. These milestones complete the local educational backend;
+actual cloud provisioning and production metadata high availability remain
+outside the delivered scope.
