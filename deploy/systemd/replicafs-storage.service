@@ -1,0 +1,32 @@
+[Unit]
+Description=ReplicaFS storage node
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/opt/replicafs /srv/replicafs
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=replicafs
+Group=replicafs
+WorkingDirectory=/opt/replicafs
+EnvironmentFile=/etc/replicafs/storage.env
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ExecStart=/opt/replicafs/.venv/bin/python -m uvicorn replicafs.storage.app:app --host ${BIND_HOST} --port ${PORT} --workers 1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/replicafs
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
