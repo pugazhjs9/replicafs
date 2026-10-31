@@ -1,4 +1,5 @@
 """Helpers shared by the metadata server and storage nodes."""
+
 import hashlib
 import math
 import os
@@ -21,8 +22,12 @@ def positive_float(name: str, default: float) -> float:
 
 def validate_filename(name: str) -> str:
     """Names are single, portable path components; Unicode and spaces are fine."""
-    if (not name or name in {".", ".."} or len(name.encode("utf-8")) > 255
-            or any(c in "/\\" or ord(c) < 32 or ord(c) == 127 for c in name)):
+    if (
+        not name
+        or name in {".", ".."}
+        or len(name.encode("utf-8")) > 255
+        or any(c in "/\\" or ord(c) < 32 or ord(c) == 127 for c in name)
+    ):
         raise ValueError("filename must be a single name of 1–255 UTF-8 bytes without control characters")
     return name
 
@@ -31,17 +36,34 @@ def normalize_origin(value: str) -> str:
     """A cluster peer must advertise an HTTP(S) origin, not an arbitrary URL."""
     try:
         parsed = urlsplit(value)
-        valid = (parsed.scheme in {"http", "https"} and parsed.hostname
-                 and parsed.username is None and parsed.password is None
-                 and not parsed.query and not parsed.fragment and parsed.path in {"", "/"}
-                 and "\\" not in value
-                 and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value))
+        valid = (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.query
+            and not parsed.fragment
+            and parsed.path in {"", "/"}
+            and "\\" not in value
+            and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)
+        )
         parsed.port
     except ValueError as exc:
         raise ValueError("URL must be an HTTP(S) origin") from exc
     if not valid:
         raise ValueError("URL must be an HTTP(S) origin without credentials, path, query or fragment")
-    return value.rstrip("/")
+    hostname = parsed.hostname.lower().rstrip(".")
+    if not hostname:
+        raise ValueError("URL must have a nonempty hostname")
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    else:
+        hostname = hostname.encode("idna").decode("ascii")
+    port = parsed.port
+    if port == 0:
+        raise ValueError("URL port must be between 1 and 65535")
+    suffix = f":{port}" if port is not None and port != {"http": 80, "https": 443}[parsed.scheme] else ""
+    return f"{parsed.scheme}://{hostname}{suffix}"
 
 
 def sha256_hex(data: bytes) -> str:

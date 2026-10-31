@@ -5,10 +5,11 @@
 A File is split into ordered Chunks. Each Chunk has several Replicas, each
 living on one Node. Nothing here holds file *content* — only where it is.
 """
-import os
-from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, ForeignKey, String, UniqueConstraint, create_engine, event
+import os
+from datetime import UTC, datetime
+
+from sqlalchemy import BigInteger, ForeignKey, Index, String, UniqueConstraint, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./data/metadata.db")
@@ -19,6 +20,7 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 if DATABASE_URL.startswith("sqlite"):
+
     @event.listens_for(engine, "connect")
     def configure_sqlite(connection, _record):
         cursor = connection.cursor()
@@ -29,7 +31,7 @@ if DATABASE_URL.startswith("sqlite"):
 
 def utcnow() -> datetime:
     # Naive UTC everywhere so comparisons work the same on SQLite and Postgres.
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -44,7 +46,7 @@ class Node(Base):
     status: Mapped[str] = mapped_column(default="ALIVE")  # ALIVE | DEAD | RECOVERING
     last_heartbeat: Mapped[datetime]
     chunk_count: Mapped[int] = mapped_column(default=0)
-    free_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    free_bytes: Mapped[int] = mapped_column(BigInteger, default=-1)  # -1 unknown; 0 full
 
 
 class File(Base):
@@ -83,7 +85,13 @@ class Replica(Base):
     node: Mapped[Node] = relationship()
 
 
+NODE_URL_INDEX = Index("uq_nodes_url", Node.url, unique=True)
+
+
 def init_db() -> None:
     if DATABASE_URL.startswith("sqlite:///"):
         os.makedirs(os.path.dirname(DATABASE_URL.removeprefix("sqlite:///")) or ".", exist_ok=True)
     Base.metadata.create_all(engine)
+    # create_all leaves existing tables alone. Add this guard to older databases
+    # too; duplicate endpoints must be reconciled rather than counted twice.
+    NODE_URL_INDEX.create(engine, checkfirst=True)

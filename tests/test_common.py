@@ -4,8 +4,13 @@ from dataclasses import dataclass
 import pytest
 
 from replicafs.common import (
-    iter_chunks, normalize_origin, pick_nodes, positive_float, positive_int,
-    sha256_hex, validate_filename,
+    iter_chunks,
+    normalize_origin,
+    pick_nodes,
+    positive_float,
+    positive_int,
+    sha256_hex,
+    validate_filename,
 )
 
 
@@ -53,7 +58,9 @@ def test_node_selection_boundaries():
         pick_nodes([], -1)
 
 
-@pytest.mark.parametrize("name", ["", ".", "..", "../secret", "a/b", "a\\b", "bad\nname", "\x00", "x" * 256, "é" * 128])
+@pytest.mark.parametrize(
+    "name", ["", ".", "..", "../secret", "a/b", "a\\b", "bad\nname", "\x00", "x" * 256, "é" * 128]
+)
 def test_invalid_filename(name):
     with pytest.raises(ValueError):
         validate_filename(name)
@@ -64,7 +71,21 @@ def test_valid_filename(name):
     assert validate_filename(name) == name
 
 
-@pytest.mark.parametrize("url", ["file:///tmp", "ftp://host", "http://user:pass@host", "http://host/a", "http://host?x=1", "http://host/#f", "http://host:bad", "http://", "http://bad host", "http://host\\evil"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///tmp",
+        "ftp://host",
+        "http://user:pass@host",
+        "http://host/a",
+        "http://host?x=1",
+        "http://host/#f",
+        "http://host:bad",
+        "http://",
+        "http://bad host",
+        "http://host\\evil",
+    ],
+)
 def test_invalid_peer_url(url):
     with pytest.raises(ValueError):
         normalize_origin(url)
@@ -95,3 +116,13 @@ def test_config_defaults_and_values(monkeypatch):
     assert positive_float("EXAMPLE_SETTING", 1.5) == 1.5
     monkeypatch.setenv("EXAMPLE_SETTING", "12")
     assert positive_int("EXAMPLE_SETTING", 5) == 12
+
+
+@pytest.mark.parametrize("url", ["http://./", "http://node:0"])
+def test_invalid_canonical_origin(url):
+    with pytest.raises(ValueError):
+        normalize_origin(url)
+
+
+def test_origin_normalizes_default_port_and_case():
+    assert normalize_origin("HTTP://NODE.Example.:80/") == "http://node.example"

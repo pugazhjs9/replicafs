@@ -5,9 +5,13 @@ from fastapi.testclient import TestClient
 from replicafs.security import cluster_headers, require_api_token, require_cluster_token
 
 
-@pytest.mark.parametrize("variable,dependency", [
-    ("API_TOKEN", require_api_token), ("CLUSTER_TOKEN", require_cluster_token),
-])
+@pytest.mark.parametrize(
+    "variable,dependency",
+    [
+        ("API_TOKEN", require_api_token),
+        ("CLUSTER_TOKEN", require_cluster_token),
+    ],
+)
 def test_tokens_are_optional_and_checked_exactly(monkeypatch, variable, dependency):
     app = FastAPI()
     app.get("/private", dependencies=[Depends(dependency)])(lambda: {"ok": True})
