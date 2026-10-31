@@ -1,52 +1,83 @@
 #!/usr/bin/env bash
-# End-to-end proof that ReplicaFS survives a node failure.
-#
-#   1. upload a 5 MB random file (-> 5 chunks x 3 replicas)
-#   2. kill node2
-#   3. download the file while node2 is dead and verify the bytes are identical
-#   4. watch the re-replicator restore full redundancy on the surviving nodes
-#   5. bring node2 back
-#
-# Run from the repo root with the cluster already up: docker compose up -d --build
+# Run from the repo root after: docker compose up -d --build
+# If enabled, export API_TOKEN to match the metadata container before running.
 set -euo pipefail
 
-BASE=${BASE:-http://localhost:8000}
-TMP=$(mktemp -d)
-NAME=demo_$(date +%s).bin
+BASE=${BASE:-http://127.0.0.1:8000}
+DEMO_TMP=$(mktemp -d)
+NAME="replicafs-demo-$(date +%s)-$$.bin"
+STOPPED=0
+AUTH=(-H "Accept: */*")
+if [ -n "${API_TOKEN:-}" ]; then AUTH=(-H "Authorization: Bearer $API_TOKEN"); fi
 
-step() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+cleanup() {
+  if [ "$STOPPED" -eq 1 ]; then docker compose start node2 >/dev/null || true; fi
+  python3 -c 'import shutil,sys; shutil.rmtree(sys.argv[1])' "$DEMO_TMP"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-step "1. upload 5 MB file"
-head -c $((5 * 1024 * 1024)) /dev/urandom > "$TMP/in.bin"
-ORIG=$(shasum -a 256 "$TMP/in.bin" | cut -d' ' -f1)
-curl -sf -F "file=@$TMP/in.bin;filename=$NAME" "$BASE/files" | python3 -m json.tool
-curl -s "$BASE/cluster" | python3 -m json.tool
+wait_state() {
+  python3 - "$BASE" "${API_TOKEN:-}" "$1" <<'PY'
+import json, sys, time, urllib.request
+base, token, state = sys.argv[1:]
+headers = {"Authorization": "Bearer " + token} if token else {}
+deadline = time.monotonic() + 90
+while time.monotonic() < deadline:
+    try:
+        def get(path):
+            request = urllib.request.Request(base + path, headers=headers)
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return json.load(response)
+        nodes = {n["id"]: n["status"] for n in get("/nodes")}
+        cluster = get("/cluster")
+        if state == "ready":
+            ok = sum(s == "ALIVE" for s in nodes.values()) >= 4
+        elif state == "healed":
+            ok = (nodes.get("node2") == "DEAD"
+                  and cluster["under_replicated_chunks"] == 0
+                  and cluster["unavailable_chunks"] == 0)
+        else:
+            ok = nodes.get("node2") == "ALIVE"
+        if ok:
+            print(json.dumps(cluster, indent=2))
+            break
+    except (OSError, ValueError, KeyError):
+        pass
+    time.sleep(0.5)
+else:
+    raise SystemExit("Timed out waiting for " + state + ". Check docker compose logs metadata.")
+PY
+}
 
-step "2. kill node2"
-docker compose kill node2
-echo "waiting for the metadata server to notice (DEAD_AFTER_SECONDS=10)..."
-sleep 13
-curl -s "$BASE/nodes" | python3 -c 'import json,sys; [print(f"  {n["id"]}: {n["status"]}") for n in json.load(sys.stdin)]'
+printf '\n1. Wait for four live storage nodes\n'
+wait_state ready
+python3 - "$DEMO_TMP/in.bin" <<'PY'
+import os, pathlib, sys
+pathlib.Path(sys.argv[1]).write_bytes(os.urandom(5 * 1024 * 1024 + 7))
+PY
+printf '\n2. Upload a multi-chunk file\n'
+curl --fail --silent --show-error "${AUTH[@]}" -F "file=@$DEMO_TMP/in.bin;filename=$NAME" "$BASE/files" | python3 -m json.tool
+curl --fail --silent --show-error "${AUTH[@]}" -o "$DEMO_TMP/before.bin" "$BASE/files/$NAME"
+cmp "$DEMO_TMP/in.bin" "$DEMO_TMP/before.bin"
 
-step "3. download while node2 is dead"
-curl -sf -o "$TMP/out.bin" "$BASE/files/$NAME"
-GOT=$(shasum -a 256 "$TMP/out.bin" | cut -d' ' -f1)
-if [ "$ORIG" = "$GOT" ]; then
-  echo "  ✅ checksums match — file survived the node failure"
-else
-  echo "  ❌ checksum mismatch"; exit 1
-fi
+printf '\n3. Stop node2, then download using surviving replicas\n'
+STOPPED=1
+# Stop keeps the node down with a restart policy; absent heartbeats trigger detection.
+docker compose stop node2
+curl --fail --silent --show-error "${AUTH[@]}" -o "$DEMO_TMP/after.bin" "$BASE/files/$NAME"
+cmp "$DEMO_TMP/in.bin" "$DEMO_TMP/after.bin"
+printf 'Byte-for-byte download matches while node2 is stopped.\n'
 
-step "4. re-replication"
-curl -s "$BASE/cluster" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"  under-replicated chunks now: {d["under_replicated_chunks"]}")'
-echo "  (with only 2 of 3 nodes alive, rf=3 cannot be met — chunks stay at 2 copies until a node returns)"
+printf '\n4. Wait for three-copy redundancy while node2 stays DEAD\n'
+wait_state healed
+curl --fail --silent --show-error "${AUTH[@]}" -o "$DEMO_TMP/healed.bin" "$BASE/files/$NAME"
+cmp "$DEMO_TMP/in.bin" "$DEMO_TMP/healed.bin"
 
-step "5. restart node2"
+printf '\n5. Start node2 again\n'
 docker compose start node2
-sleep 5
-curl -s "$BASE/nodes" | python3 -c 'import json,sys; [print(f"  {n["id"]}: {n["status"]}") for n in json.load(sys.stdin)]'
-curl -s "$BASE/cluster" | python3 -m json.tool
-
-echo
-echo "Done. Try: docker compose logs -f metadata   (to watch heartbeats / re-replication)"
-rm -rf "$TMP"
+STOPPED=0
+wait_state returned
+printf '\nPASS: bytes survived failure and redundancy recovered before the node returned.\n'
+printf 'The uploaded demo file remains available as %s.\n' "$NAME"

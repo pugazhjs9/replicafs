@@ -1,0 +1,17 @@
+.git
+.venv
+.env
+.env.*
+!.env.example
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.db
+*.db-*
+data
+htmlcov
+.coverage*
+tests
+docs
+.DS_Store

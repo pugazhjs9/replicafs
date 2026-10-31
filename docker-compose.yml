@@ -1,57 +1,96 @@
-# Local 4-process cluster: 1 metadata server + 3 storage nodes.
-# Each node has its own volume, so killing one really does make its chunks unreachable.
+# Learning cluster: one coordinator + four separate storage processes/disks.
+# RF=3 leaves a fourth node available to replace a failed copy.
+x-storage: &storage
+  build: .
+  restart: unless-stopped
+  depends_on:
+    metadata:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['PORT'] + '/health', timeout=2)"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+  environment: &storage-env
+    METADATA_URL: http://metadata:8000
+    DATA_DIR: /data
+    HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-3}
+    MAX_CHUNK_BYTES: ${MAX_CHUNK_BYTES:-8388608}
+    CLUSTER_TOKEN: ${CLUSTER_TOKEN:-}
 
 services:
   metadata:
     build: .
-    command: uvicorn replicafs.metadata.app:app --host 0.0.0.0 --port 8000
-    ports: ["8000:8000"]
+    restart: unless-stopped
+    command: uvicorn replicafs.metadata.app:app --host 0.0.0.0 --port 8000 --workers 1
+    ports: ["127.0.0.1:8000:8000"]
     environment:
       DATABASE_URL: sqlite:////data/metadata.db
-      CHUNK_SIZE: "1048576"        # 1 MB chunks so small demo files still split
-      REPLICATION_FACTOR: "3"
-      DEAD_AFTER_SECONDS: "10"
-      MONITOR_INTERVAL: "5"
+      CHUNK_SIZE: ${CHUNK_SIZE:-1048576}
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-3}
+      DEAD_AFTER_SECONDS: ${DEAD_AFTER_SECONDS:-10}
+      MONITOR_INTERVAL: ${MONITOR_INTERVAL:-5}
+      MIN_WRITE_REPLICAS: ${MIN_WRITE_REPLICAS:-1}
+      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-1073741824}
+      SCRUB_INTERVAL: ${SCRUB_INTERVAL:-30}
+      SCRUB_BATCH_SIZE: ${SCRUB_BATCH_SIZE:-100}
+      API_TOKEN: ${API_TOKEN:-}
+      CLUSTER_TOKEN: ${CLUSTER_TOKEN:-}
     volumes: [metadata-data:/data]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   node1:
-    build: .
-    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8001
-    ports: ["8001:8001"]
+    <<: *storage
+    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8001 --workers 1
+    ports: ["127.0.0.1:8001:8001"]
     environment:
+      <<: *storage-env
       NODE_ID: node1
       NODE_URL: http://node1:8001
-      METADATA_URL: http://metadata:8000
-      DATA_DIR: /data
+      PORT: "8001"
     volumes: [node1-data:/data]
-    depends_on: [metadata]
 
   node2:
-    build: .
-    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8002
-    ports: ["8002:8002"]
+    <<: *storage
+    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8002 --workers 1
+    ports: ["127.0.0.1:8002:8002"]
     environment:
+      <<: *storage-env
       NODE_ID: node2
       NODE_URL: http://node2:8002
-      METADATA_URL: http://metadata:8000
-      DATA_DIR: /data
+      PORT: "8002"
     volumes: [node2-data:/data]
-    depends_on: [metadata]
 
   node3:
-    build: .
-    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8003
-    ports: ["8003:8003"]
+    <<: *storage
+    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8003 --workers 1
+    ports: ["127.0.0.1:8003:8003"]
     environment:
+      <<: *storage-env
       NODE_ID: node3
       NODE_URL: http://node3:8003
-      METADATA_URL: http://metadata:8000
-      DATA_DIR: /data
+      PORT: "8003"
     volumes: [node3-data:/data]
-    depends_on: [metadata]
+
+  node4:
+    <<: *storage
+    command: uvicorn replicafs.storage.app:app --host 0.0.0.0 --port 8004 --workers 1
+    ports: ["127.0.0.1:8004:8004"]
+    environment:
+      <<: *storage-env
+      NODE_ID: node4
+      NODE_URL: http://node4:8004
+      PORT: "8004"
+    volumes: [node4-data:/data]
 
 volumes:
   metadata-data:
   node1-data:
   node2-data:
   node3-data:
+  node4-data:
