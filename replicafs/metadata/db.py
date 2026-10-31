@@ -8,14 +8,23 @@ living on one Node. Nothing here holds file *content* — only where it is.
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, ForeignKey, String, UniqueConstraint, create_engine
+from sqlalchemy import BigInteger, ForeignKey, String, UniqueConstraint, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./data/metadata.db")
 
-_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+_connect_args = {"check_same_thread": False, "timeout": 30} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=_connect_args)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+if DATABASE_URL.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def configure_sqlite(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
 
 
 def utcnow() -> datetime:
@@ -32,7 +41,7 @@ class Node(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     url: Mapped[str]
-    status: Mapped[str] = mapped_column(default="ALIVE")  # ALIVE | DEAD
+    status: Mapped[str] = mapped_column(default="ALIVE")  # ALIVE | DEAD | RECOVERING
     last_heartbeat: Mapped[datetime]
     chunk_count: Mapped[int] = mapped_column(default=0)
     free_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
