@@ -6,3 +6,15 @@ data/
 *.db
 *.tmp
 .DS_Store
+.env
+.env.*
+!.env.example
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ruff_cache/
+*.log
+*.egg-info/
+dist/
+build/
