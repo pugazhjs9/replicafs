@@ -3,6 +3,7 @@
 Storage nodes know chunk ids and bytes, not filenames or versions. The metadata
 server decides placement and supplies the expected SHA-256 checksum.
 """
+
 import logging
 import os
 import re
@@ -17,17 +18,15 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator
 
-from replicafs.common import sha256_hex
+from replicafs.common import positive_float, positive_int, sha256_hex
 from replicafs.security import cluster_headers, require_cluster_token
 
 NODE_ID = os.environ.get("NODE_ID", "node1")
 NODE_URL = os.environ.get("NODE_URL", "http://localhost:8001")
 METADATA_URL = os.environ.get("METADATA_URL", "http://localhost:8000")
 DATA_DIR = Path(os.environ.get("DATA_DIR", f"./data/{NODE_ID}"))
-HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "3"))
-MAX_CHUNK_BYTES = int(os.environ.get("MAX_CHUNK_BYTES", str(8 * 1024 * 1024)))
-if HEARTBEAT_INTERVAL <= 0 or MAX_CHUNK_BYTES <= 0:
-    raise ValueError("HEARTBEAT_INTERVAL and MAX_CHUNK_BYTES must be positive")
+HEARTBEAT_INTERVAL = positive_float("HEARTBEAT_INTERVAL", 3)
+MAX_CHUNK_BYTES = positive_int("MAX_CHUNK_BYTES", 8 * 1024 * 1024)
 
 log = logging.getLogger(f"storage.{NODE_ID}")
 CHUNK_ID = re.compile(r"[A-Za-z0-9]{1,128}\Z", re.ASCII)
@@ -72,13 +71,15 @@ def write_chunk_atomically(path: Path, data: bytes) -> None:
 
 def local_chunk_count() -> int:
     return sum(
-        1 for path in DATA_DIR.iterdir()
+        1
+        for path in DATA_DIR.iterdir()
         if CHUNK_ID.fullmatch(path.name) and path.is_file() and not path.is_symlink()
     )
 
 
 def heartbeat_loop(stop: threading.Event) -> None:
     """Keep retrying metadata outages and stop promptly during server shutdown."""
+    restarted = True
     while not stop.is_set():
         try:
             response = httpx.post(
@@ -89,10 +90,13 @@ def heartbeat_loop(stop: threading.Event) -> None:
                     "url": NODE_URL,
                     "chunk_count": local_chunk_count(),
                     "free_bytes": shutil.disk_usage(DATA_DIR).free,
+                    "restarted": restarted,
                 },
                 timeout=2,
+                trust_env=False,
             )
             response.raise_for_status()
+            restarted = False
         except (httpx.HTTPError, OSError) as exc:
             log.warning("heartbeat failed: %s", exc)
         stop.wait(HEARTBEAT_INTERVAL)
@@ -168,7 +172,9 @@ def get_chunk(chunk_id: str):
         raise HTTPException(status_code=507, detail="could not read chunk from disk") from exc
     if len(data) > MAX_CHUNK_BYTES:
         raise HTTPException(status_code=413, detail="stored chunk exceeds MAX_CHUNK_BYTES")
-    return Response(content=data, media_type="application/octet-stream", headers={"X-Checksum": sha256_hex(data)})
+    return Response(
+        content=data, media_type="application/octet-stream", headers={"X-Checksum": sha256_hex(data)}
+    )
 
 
 @app.delete("/chunks/{chunk_id}", dependencies=INTERNAL)
@@ -206,17 +212,23 @@ class ReplicateRequest(BaseModel):
         try:
             parsed = urlsplit(value)
             valid = (
-                parsed.scheme in {"http", "https"} and parsed.hostname
-                and parsed.username is None and parsed.password is None
-                and not parsed.query and not parsed.fragment
-                and parsed.path in {"", "/"} and "\\" not in value
+                parsed.scheme in {"http", "https"}
+                and parsed.hostname
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and parsed.path in {"", "/"}
+                and "\\" not in value
                 and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value)
             )
             parsed.port  # Validate a malformed/non-numeric port too.
         except ValueError as exc:
             raise ValueError("source_url must be an HTTP(S) origin") from exc
         if not valid:
-            raise ValueError("source_url must be an HTTP(S) origin without credentials, path, query or fragment")
+            raise ValueError(
+                "source_url must be an HTTP(S) origin without credentials, path, query or fragment"
+            )
         return value.rstrip("/")
 
 
@@ -227,8 +239,11 @@ def replicate(req: ReplicateRequest):
     data = bytearray()
     try:
         with httpx.stream(
-            "GET", f"{req.source_url}/chunks/{req.chunk_id}",
-            headers=cluster_headers(), timeout=30,
+            "GET",
+            f"{req.source_url}/chunks/{req.chunk_id}",
+            headers=cluster_headers(),
+            timeout=30,
+            trust_env=False,
         ) as response:
             response.raise_for_status()
             for part in response.iter_bytes(chunk_size=64 * 1024):
@@ -246,4 +261,9 @@ def replicate(req: ReplicateRequest):
     except OSError as exc:
         raise HTTPException(status_code=507, detail="could not write replica to disk") from exc
     log.info("replicated chunk %s from %s", req.chunk_id, req.source_url)
-    return {"chunk_id": req.chunk_id, "replicated_from": req.source_url, "checksum": actual, "size": len(data)}
+    return {
+        "chunk_id": req.chunk_id,
+        "replicated_from": req.source_url,
+        "checksum": actual,
+        "size": len(data),
+    }

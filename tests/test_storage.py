@@ -3,7 +3,11 @@
 No server ports or real cloud accounts are required. Source downloads in repair
 requests are mocked; the filesystem and atomic-write code are real.
 """
+
 import errno
+import os
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -51,7 +55,12 @@ def source_response(monkeypatch, data=b"replica", status=200):
 
 
 def replicate_payload(data=b"replica", **overrides):
-    return {"chunk_id": "chunk1", "source_url": "http://node1:8001", "checksum": sha256_hex(data), **overrides}
+    return {
+        "chunk_id": "chunk1",
+        "source_url": "http://node1:8001",
+        "checksum": sha256_hex(data),
+        **overrides,
+    }
 
 
 @pytest.mark.parametrize("data", [b"", b"hello", bytes(range(256)) * 4])
@@ -192,18 +201,32 @@ def test_replicate_verifies_content_and_reports_receipt(client, tmp_path, monkey
     response = client.post("/replicate", json=replicate_payload(source_url="http://node1:8001/"))
     assert response.status_code == 200
     assert response.json() == {
-        "chunk_id": "chunk1", "checksum": sha256_hex(b"replica"), "size": 7,
+        "chunk_id": "chunk1",
+        "checksum": sha256_hex(b"replica"),
+        "size": 7,
         "replicated_from": "http://node1:8001",
     }
     assert (tmp_path / "chunk1").read_bytes() == b"replica"
     assert calls[0][0:2] == ("GET", "http://node1:8001/chunks/chunk1")
+    assert calls[0][2]["trust_env"] is False
 
 
-@pytest.mark.parametrize("source", [
-    "file:///etc/passwd", "ftp://host", "http://user:secret@host", "http://host/path",
-    "http://host?query", "http://host#fragment", "http://", "http://host:bad", "http://host /",
-    "\x00http://host", "http://host\\other",
-])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "file:///etc/passwd",
+        "ftp://host",
+        "http://user:secret@host",
+        "http://host/path",
+        "http://host?query",
+        "http://host#fragment",
+        "http://",
+        "http://host:bad",
+        "http://host /",
+        "\x00http://host",
+        "http://host\\other",
+    ],
+)
 def test_replicate_rejects_invalid_source_before_network(client, monkeypatch, source):
     calls = source_response(monkeypatch)
     assert client.post("/replicate", json=replicate_payload(source_url=source)).status_code == 422
@@ -255,12 +278,16 @@ def test_replicate_disk_failure_is_controlled(client, monkeypatch):
     assert client.post("/replicate", json=replicate_payload()).status_code == 507
 
 
-@pytest.mark.parametrize("method,path,kwargs", [
-    ("put", "/chunks/chunk1", {"content": b"bytes"}),
-    ("get", "/chunks/chunk1", {}),
-    ("delete", "/chunks/chunk1", {}),
-    ("post", "/replicate", {"json": replicate_payload()}),
-])
+@pytest.mark.parametrize(
+    "method,path,kwargs",
+    [
+        ("put", "/chunks/chunk1", {"content": b"bytes"}),
+        ("put", "/chunks/chunk1", {"content": b"x" * 1025}),
+        ("get", "/chunks/chunk1", {}),
+        ("delete", "/chunks/chunk1", {}),
+        ("post", "/replicate", {"json": replicate_payload()}),
+    ],
+)
 def test_all_internal_endpoints_require_cluster_token(client, monkeypatch, method, path, kwargs):
     monkeypatch.setenv("CLUSTER_TOKEN", "cluster-secret")
     request = getattr(client, method)
@@ -272,9 +299,12 @@ def test_all_internal_endpoints_require_cluster_token(client, monkeypatch, metho
 def test_valid_cluster_token_is_forwarded_to_replication_source(client, monkeypatch):
     monkeypatch.setenv("CLUSTER_TOKEN", "cluster-secret")
     calls = source_response(monkeypatch)
-    response = client.post("/replicate", json=replicate_payload(), headers={"Authorization": "Bearer cluster-secret"})
+    response = client.post(
+        "/replicate", json=replicate_payload(), headers={"Authorization": "Bearer cluster-secret"}
+    )
     assert response.status_code == 200
     assert calls[0][2]["headers"] == {"Authorization": "Bearer cluster-secret"}
+    assert calls[0][2]["trust_env"] is False
 
 
 def test_valid_cluster_token_allows_storage_roundtrip(client, monkeypatch):
@@ -301,8 +331,31 @@ def test_heartbeat_forwards_token_and_checks_http_status(tmp_path, monkeypatch, 
     HEARTBEAT_LOOP(stop)
     assert len(calls) == 1
     assert calls[0][1]["headers"] == {"Authorization": "Bearer cluster-secret"}
+    assert calls[0][1]["trust_env"] is False
     assert calls[0][1]["json"]["chunk_count"] == 0
+    assert calls[0][1]["json"]["restarted"] is True
     assert ("heartbeat failed" in caplog.text) is (status == 500)
+
+
+@pytest.mark.parametrize("statuses", [[200, 200], [500, 200, 200], ["offline", 200, 200]])
+def test_restart_notice_is_retried_until_acknowledged(tmp_path, monkeypatch, statuses):
+    monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(storage, "HEARTBEAT_INTERVAL", 0)
+    stop = threading.Event()
+    notices = []
+
+    def post(url, **kwargs):
+        index = len(notices)
+        notices.append(kwargs["json"]["restarted"])
+        if len(notices) == len(statuses):
+            stop.set()
+        if statuses[index] == "offline":
+            raise httpx.ConnectError("metadata unavailable")
+        return httpx.Response(statuses[index], request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(storage.httpx, "post", post)
+    HEARTBEAT_LOOP(stop)
+    assert notices == [True] * (len(statuses) - 1) + [False]
 
 
 def test_lifespan_stops_heartbeat_worker(tmp_path, monkeypatch):
@@ -318,3 +371,25 @@ def test_lifespan_stops_heartbeat_worker(tmp_path, monkeypatch):
         assert test_client.get("/health").status_code == 200
         assert not finished.is_set()
     assert finished.is_set()
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("HEARTBEAT_INTERVAL", "nan"),
+        ("HEARTBEAT_INTERVAL", "inf"),
+        ("HEARTBEAT_INTERVAL", "0"),
+        ("MAX_CHUNK_BYTES", "0"),
+        ("MAX_CHUNK_BYTES", "-1"),
+    ],
+)
+def test_invalid_environment_prevents_storage_startup(name, value):
+    result = subprocess.run(
+        [sys.executable, "-c", "import replicafs.storage.app"],
+        env={**os.environ, name: value},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert f"ValueError: {name} must be" in result.stderr
