@@ -39,6 +39,10 @@ Use `scripts/demo_failover.sh` for the repeatable failure portion. If asked “w
 
 **Technologies:** Python, FastAPI, SQLAlchemy, SQLite, HTTPX, Docker Compose, pytest, GitHub Actions.
 
+The [verification record](10-verification.md) supports a concrete testing claim:
+298 automated cases, including 18 real-process acceptance tests, and 95.7%
+combined statement/branch coverage on the recorded implementation revision.
+
 Possible bullets, after you can explain and demonstrate each one:
 
 - Built a distributed file-storage backend with configurable chunking, separate-node replication, SHA-256 integrity checks, version history, and soft-delete recovery.

@@ -2,6 +2,9 @@
 
 Testing asks a precise question: “For this input and failure, did the program behave as expected?” A finite suite cannot cover every machine, disk failure, network schedule, or hostile input. The goal here is repeatable evidence for the important behaviors and boundaries.
 
+See the [dated verification record](10-verification.md) for measured results and
+the exact tested revision.
+
 ## Install and run
 
 From an activated virtual environment in the repository root:

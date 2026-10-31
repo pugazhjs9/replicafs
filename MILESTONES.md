@@ -69,7 +69,8 @@ results belong in the testing guide after implementation and verification.
 | `cde3c7a` | Supervised Linux metadata/storage services with private-network settings. |
 | `4d206e3` | Recovery generation guard: stale checks cannot approve a newer restart. |
 
-The remaining documentation commits provide the beginner lessons and measured
-verification record. These milestones complete the local educational backend;
+Commit `925ea55` provides the beginner lessons; the final documentation commit
+records [298 passing tests and 95.7% combined coverage](docs/10-verification.md).
+All nine planned local milestones are delivered. These complete the educational backend;
 actual cloud provisioning and production metadata high availability remain
 outside the delivered scope.
