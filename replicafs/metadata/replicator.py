@@ -81,10 +81,10 @@ def validate_recovering_nodes(db: Session, client: httpx.Client) -> int:
             chunk = db.get(Chunk, replica.chunk_id)
             if chunk is not None:
                 claims.append((chunk.id, chunk.checksum, chunk.size))
-        plans.append((node.id, node.url, claims))
+        plans.append((node.id, node.url, node.recovery_generation, claims))
     db.rollback()
     results = []
-    for node_id, url, claims in plans:
+    for node_id, url, generation, claims in plans:
         verified = True
         bad_ids = []
         for chunk_id, checksum, size in claims:
@@ -94,13 +94,27 @@ def validate_recovering_nodes(db: Session, client: httpx.Client) -> int:
             except httpx.HTTPError as exc:
                 verified = False
                 log.warning("returning node %s cannot yet verify chunk %s: %s", node_id, chunk_id, exc)
-        results.append((node_id, url, {claim[0] for claim in claims}, verified, bad_ids))
+        results.append((node_id, url, generation, {claim[0] for claim in claims}, verified, bad_ids))
 
     recovered = 0
-    for node_id, url, checked_ids, verified, bad_ids in results:
-        node = db.get(Node, node_id)
-        if node is None or node.url != url:
+    for node_id, url, generation, checked_ids, verified, bad_ids in results:
+        # Fence the entire short mutation phase, including bad-claim deletions.
+        # This conditional no-op UPDATE takes a write lock until commit, so a
+        # new startup cannot change the generation between this guard and the
+        # mutations. No database lock is held during any HTTP request.
+        current = (
+            db.query(Node)
+            .filter(
+                Node.id == node_id,
+                Node.url == url,
+                Node.status == "RECOVERING",
+                Node.recovery_generation == generation,
+            )
+            .update({Node.recovery_generation: Node.recovery_generation}, synchronize_session=False)
+        )
+        if not current:
             continue
+        node = db.get(Node, node_id)
         removed = 0
         for chunk_id in bad_ids:
             removed += (
@@ -119,7 +133,12 @@ def validate_recovering_nodes(db: Session, client: httpx.Client) -> int:
             # promote the state we actually validated, without reviving DEAD.
             changed = (
                 db.query(Node)
-                .filter(Node.id == node_id, Node.url == url, Node.status == "RECOVERING")
+                .filter(
+                    Node.id == node_id,
+                    Node.url == url,
+                    Node.status == "RECOVERING",
+                    Node.recovery_generation == generation,
+                )
                 .update(
                     {Node.status: "ALIVE"},
                     synchronize_session=False,

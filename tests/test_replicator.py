@@ -525,3 +525,31 @@ def test_claim_added_during_revalidation_must_wait_for_next_verification_pass(db
     with httpx.Client(transport=httpx.MockTransport(lambda req: response_for(req, content=DATA))) as client:
         assert replicator.validate_recovering_nodes(db, client) == 1
     assert node.status == "ALIVE"
+
+
+@pytest.mark.parametrize("old_body", [DATA, b"old corrupt bytes"])
+def test_second_restart_during_revalidation_invalidates_entire_old_result(db, old_body):
+    node = add_node(db, "source", status="RECOVERING")
+    add_chunk(db, holders=("source",))
+    initial_generation = node.recovery_generation
+
+    def handler(request):
+        # A second startup lands while the previous incarnation's read is in
+        # flight. The state is still RECOVERING, but this is a new generation.
+        db.query(Node).filter(Node.id == "source").update(
+            {Node.recovery_generation: Node.recovery_generation + 1},
+            synchronize_session=False,
+        )
+        db.commit()
+        return response_for(request, content=old_body)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert replicator.validate_recovering_nodes(db, client) == 0
+    assert node.status == "RECOVERING"
+    assert node.recovery_generation == initial_generation + 1
+    # Neither an old valid read may promote the new process, nor an old corrupt
+    # read may delete a claim whose fresh disk still needs to be examined.
+    assert db.query(Replica).count() == 1
+    with httpx.Client(transport=httpx.MockTransport(lambda req: response_for(req, content=DATA))) as client:
+        assert replicator.validate_recovering_nodes(db, client) == 1
+    assert node.status == "ALIVE"

@@ -9,7 +9,7 @@ living on one Node. Nothing here holds file *content* — only where it is.
 import os
 from datetime import UTC, datetime
 
-from sqlalchemy import BigInteger, ForeignKey, Index, String, UniqueConstraint, create_engine, event
+from sqlalchemy import BigInteger, ForeignKey, Index, String, UniqueConstraint, create_engine, event, inspect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./data/metadata.db")
@@ -47,6 +47,7 @@ class Node(Base):
     last_heartbeat: Mapped[datetime]
     chunk_count: Mapped[int] = mapped_column(default=0)
     free_bytes: Mapped[int] = mapped_column(BigInteger, default=-1)  # -1 unknown; 0 full
+    recovery_generation: Mapped[int] = mapped_column(default=0, server_default="0")
 
 
 class File(Base):
@@ -92,6 +93,13 @@ def init_db() -> None:
     if DATABASE_URL.startswith("sqlite:///"):
         os.makedirs(os.path.dirname(DATABASE_URL.removeprefix("sqlite:///")) or ".", exist_ok=True)
     Base.metadata.create_all(engine)
+    columns = {column["name"] for column in inspect(engine).get_columns("nodes")}
+    if "recovery_generation" not in columns:
+        # Additive upgrade: old rows and chunk locations remain intact.
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE nodes ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0"
+            )
     # create_all leaves existing tables alone. Add this guard to older databases
     # too; duplicate endpoints must be reconciled rather than counted twice.
     NODE_URL_INDEX.create(engine, checkfirst=True)

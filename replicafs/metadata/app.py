@@ -155,7 +155,13 @@ def heartbeat(hb: Heartbeat, db: Session = Depends(get_db)):
             status_code=409, detail="node id already registered at a different URL; use a new node id"
         )
     elif node.status == "DEAD" or hb.restarted:
-        node.status = "RECOVERING"
+        # A second restart during an integrity pass must invalidate that pass.
+        # SQL increment avoids losing concurrent startup notifications.
+        db.query(Node).filter(Node.id == node.id).update(
+            {Node.status: "RECOVERING", Node.recovery_generation: Node.recovery_generation + 1},
+            synchronize_session=False,
+        )
+        db.expire(node)
     node.last_heartbeat = utcnow()
     node.chunk_count = hb.chunk_count
     node.free_bytes = hb.free_bytes

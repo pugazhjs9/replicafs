@@ -555,6 +555,8 @@ def test_same_node_can_heartbeat_with_equivalent_origin_spelling(api):
 
 def test_restarted_live_node_is_quarantined_before_its_existing_claims_are_trusted(api):
     api.nodes(1)
+    with api.sessions() as db:
+        assert db.get(Node, "node1").recovery_generation == 0
     assert api.upload(b"abcd").status_code == 201
     assert api.count(Replica) == 1
     assert api.heartbeat(restarted=True).status_code == 200
@@ -563,12 +565,31 @@ def test_restarted_live_node_is_quarantined_before_its_existing_claims_are_trust
     assert api.client.get("/files/sample.bin").status_code == 503
     assert api.heartbeat(restarted=False).status_code == 200
     assert api.client.get("/nodes").json()[0]["status"] == "RECOVERING"
+    with api.sessions() as db:
+        assert db.get(Node, "node1").recovery_generation == 1
+    assert api.heartbeat(restarted=True).status_code == 200
+    with api.sessions() as db:
+        assert db.get(Node, "node1").recovery_generation == 2
 
 
 def test_restarted_first_registration_can_join_alive_without_prior_claims(api):
     assert api.heartbeat(restarted=True).status_code == 200
     assert api.client.get("/nodes").json()[0]["status"] == "ALIVE"
     assert api.count(Replica) == 0
+    with api.sessions() as db:
+        assert db.get(Node, "node1").recovery_generation == 0
+
+
+def test_concurrent_restart_heartbeats_do_not_lose_recovery_generation_increments(api):
+    assert api.heartbeat().status_code == 200
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(lambda _: api.heartbeat(restarted=True), range(4)))
+    assert all(response.status_code == 200 for response in responses)
+    with api.sessions() as db:
+        assert db.get(Node, "node1").recovery_generation == 4
+    assert api.heartbeat(restarted=False).status_code == 200
+    with api.sessions() as db:
+        assert db.get(Node, "node1").recovery_generation == 4
 
 
 def test_concurrent_node_registrations_cannot_inflate_replication_with_one_endpoint(api):
@@ -593,6 +614,8 @@ def test_returning_heartbeat_cannot_skip_inventory_verification(api, status):
         db.commit()
     assert api.heartbeat().status_code == 200
     assert api.client.get("/nodes").json()[0]["status"] == "RECOVERING"
+    with api.sessions() as db:
+        assert db.get(Node, "node1").recovery_generation == (1 if status == "DEAD" else 0)
 
 
 def test_heartbeat_marks_stale_node_recovering_even_before_monitor(api):
@@ -602,6 +625,8 @@ def test_heartbeat_marks_stale_node_recovering_even_before_monitor(api):
         db.commit()
     assert api.heartbeat().status_code == 200
     assert api.client.get("/nodes").json()[0]["status"] == "RECOVERING"
+    with api.sessions() as db:
+        assert db.get(Node, "node1").recovery_generation == 1
 
 
 @pytest.mark.parametrize(

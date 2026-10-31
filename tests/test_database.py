@@ -80,7 +80,9 @@ def test_init_creates_parent_directories_and_is_safe_to_repeat(engine):
         session.commit()
     database.init_db()
     with sessions() as session:
-        assert session.query(database.Node).one().url == "http://node1:8001"
+        stored = session.query(database.Node).one()
+        assert stored.url == "http://node1:8001"
+        assert stored.recovery_generation == 0
 
 
 def test_sqlite_integrity_settings_apply_to_every_new_connection(engine):
@@ -149,12 +151,23 @@ def test_file_version_constraint_is_the_final_concurrent_write_guard(engine):
 def test_legacy_database_gains_unique_endpoint_index_without_losing_data(engine):
     create_legacy_nodes(engine)
     assert "uq_nodes_url" not in {index["name"] for index in inspect(engine).get_indexes("nodes")}
+    assert "recovery_generation" not in {column["name"] for column in inspect(engine).get_columns("nodes")}
     database.init_db()
     database.init_db()
     assert "uq_nodes_url" in {index["name"] for index in inspect(engine).get_indexes("nodes")}
     with engine.connect() as connection:
-        row = connection.execute(text("SELECT id, url, chunk_count, free_bytes FROM nodes")).one()
-        assert tuple(row) == ("node1", "http://node1:8001", 7, 12345)
+        row = connection.execute(
+            text("SELECT id, url, chunk_count, free_bytes, recovery_generation FROM nodes")
+        ).one()
+        assert tuple(row) == ("node1", "http://node1:8001", 7, 12345, 0)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE nodes SET recovery_generation = 11 WHERE id = 'node1'"))
+    database.init_db()
+    with engine.connect() as connection:
+        assert (
+            connection.execute(text("SELECT recovery_generation FROM nodes WHERE id = 'node1'")).scalar()
+            == 11
+        )
     with engine.begin() as connection, pytest.raises(IntegrityError):
         connection.execute(
             text("""
@@ -180,3 +193,16 @@ def test_duplicate_legacy_endpoints_fail_migration_without_deleting_records(engi
         connection.execute(text("DELETE FROM nodes WHERE id = 'node2'"))
     database.init_db()
     assert "uq_nodes_url" in {index["name"] for index in inspect(engine).get_indexes("nodes")}
+
+
+def test_recovery_generation_has_server_default_for_new_node_inserts(engine):
+    database.init_db()
+    with engine.begin() as connection:
+        connection.execute(
+            text("""
+            INSERT INTO nodes (id, url, status, last_heartbeat, chunk_count, free_bytes)
+            VALUES ('node1', 'http://node1:8001', 'ALIVE', '2026-10-31 00:00:00', 0, 12345)
+        """)
+        )
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT recovery_generation FROM nodes")).scalar() == 0
