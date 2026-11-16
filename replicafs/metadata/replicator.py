@@ -8,6 +8,8 @@ then commits short mutations so slow storage never holds a database write lock.
 
 import hashlib
 import logging
+import threading
+from collections import deque
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -15,10 +17,38 @@ import httpx
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from replicafs.metadata.db import Chunk, Node, Replica, utcnow
+from replicafs.metadata.db import Chunk, File, Node, Replica, utcnow
 from replicafs.security import cluster_headers
 
 log = logging.getLogger("metadata.replicator")
+
+# A short in-memory history for the dashboard. A scrub and its repair can both
+# finish inside one dashboard refresh, so the final state alone would hide them.
+_events: deque[dict] = deque(maxlen=200)
+_event_count = 0
+_event_lock = threading.Lock()
+
+
+def record_event(kind: str, message: str, chunk_id: str | None = None, node_id: str | None = None) -> None:
+    global _event_count
+    with _event_lock:
+        _event_count += 1
+        _events.append(
+            {"id": _event_count, "kind": kind, "message": message, "chunk_id": chunk_id, "node_id": node_id}
+        )
+
+
+def events_after(after: int) -> dict:
+    with _event_lock:
+        return {"latest": _event_count, "events": [e for e in _events if e["id"] > after]}
+
+
+def describe_chunk(db: Session, chunk_id: str) -> str:
+    chunk = db.get(Chunk, chunk_id)
+    if chunk is None:
+        return f"chunk {chunk_id[:8]}"
+    record = db.get(File, chunk.file_id)
+    return f"chunk {chunk.index} of {record.name} (v{record.version})"
 
 
 def mark_dead_nodes(db: Session, dead_after_seconds: float) -> int:
@@ -97,6 +127,7 @@ def validate_recovering_nodes(db: Session, client: httpx.Client) -> int:
         results.append((node_id, url, generation, {claim[0] for claim in claims}, verified, bad_ids))
 
     recovered = 0
+    events = []
     for node_id, url, generation, checked_ids, verified, bad_ids in results:
         # Fence the entire short mutation phase, including bad-claim deletions.
         # This conditional no-op UPDATE takes a write lock until commit, so a
@@ -117,12 +148,21 @@ def validate_recovering_nodes(db: Session, client: httpx.Client) -> int:
         node = db.get(Node, node_id)
         removed = 0
         for chunk_id in bad_ids:
-            removed += (
+            deleted = (
                 db.query(Replica)
                 .filter(Replica.chunk_id == chunk_id, Replica.node_id == node_id)
                 .delete(synchronize_session="fetch")
             )
+            removed += deleted
             log.warning("returning node %s lost/corrupted chunk %s; claim removed", node_id, chunk_id)
+            if deleted:
+                events.append(
+                    (
+                        f"{node_id} came back without a good copy of {describe_chunk(db, chunk_id)}",
+                        chunk_id,
+                        node_id,
+                    )
+                )
         if removed:
             node.chunk_count = max(0, node.chunk_count - removed)
         # A concurrent upload may have added a claim while HTTP checks ran. It
@@ -149,6 +189,8 @@ def validate_recovering_nodes(db: Session, client: httpx.Client) -> int:
                 log.info("node %s revalidated and ALIVE", node_id)
     db.commit()
     db.expire_all()
+    for message, chunk_id, node_id in events:
+        record_event("bad", message, chunk_id, node_id)
     return recovered
 
 
@@ -235,7 +277,7 @@ def re_replicate(db: Session, client: httpx.Client, rf: int) -> int:
                 except (httpx.HTTPError, ValueError) as exc:
                     log.warning("repair of %s from %s to %s failed: %s", chunk_id, source.id, target.id, exc)
                     continue
-                receipts.append((chunk_id, target.id))
+                receipts.append((chunk_id, target.id, source.id))
                 holders.add(target.id)
                 target.chunk_count += 1
                 if target.free_bytes >= 0:
@@ -243,7 +285,8 @@ def re_replicate(db: Session, client: httpx.Client, rf: int) -> int:
                 log.info("repaired chunk %s: %s -> %s", chunk_id[:8], source.id, target.id)
                 break
     fixed = 0
-    for chunk_id, target_id in receipts:
+    events = []
+    for chunk_id, target_id, source_id in receipts:
         # The single monitor avoids competing repairs; the composite key is the
         # final duplicate guard. A repeated pass with enough copies is a no-op.
         if db.get(Chunk, chunk_id) is None or db.get(Replica, (chunk_id, target_id)) is not None:
@@ -257,8 +300,17 @@ def re_replicate(db: Session, client: httpx.Client, rf: int) -> int:
         if budget >= 0:
             target.free_bytes = budget if target.free_bytes == -1 else min(target.free_bytes, budget)
         fixed += 1
+        events.append(
+            (
+                f"Repair: copied {describe_chunk(db, chunk_id)} from {source_id} to {target_id}",
+                chunk_id,
+                target_id,
+            )
+        )
     db.commit()
     db.expire_all()
+    for message, chunk_id, node_id in events:
+        record_event("ok", message, chunk_id, node_id)
     return fixed
 
 
@@ -313,6 +365,7 @@ def verify_replicas(
         except httpx.HTTPError as exc:
             log.warning("scrub could not reach chunk %s on %s: %s", chunk_id, node_id, exc)
     removed = 0
+    events = []
     for chunk_id, node_id in bad:
         changed = (
             db.query(Replica)
@@ -325,6 +378,16 @@ def verify_replicas(
                 node.chunk_count = max(0, node.chunk_count - changed)
             removed += changed
             log.warning("scrub discarded missing/corrupt chunk %s on %s", chunk_id, node_id)
+            events.append(
+                (
+                    f"Integrity scan: the copy of {describe_chunk(db, chunk_id)} on {node_id} "
+                    "failed its SHA-256 check and is no longer trusted",
+                    chunk_id,
+                    node_id,
+                )
+            )
     db.commit()
     db.expire_all()
+    for message, chunk_id, node_id in events:
+        record_event("bad", message, chunk_id, node_id)
     return {"checked": checked, "removed": removed, "next_cursor": next_cursor}

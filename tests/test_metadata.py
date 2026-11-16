@@ -763,6 +763,28 @@ def test_on_demand_scrub_drops_only_the_silently_corrupted_copy(api):
     assert api.client.get("/files/sample.bin").content == b"abcdefghij"
 
 
+def test_events_report_scrub_and_download_findings_in_order(api):
+    api.nodes()
+    api.upload(b"abcdefghij")
+    start = api.client.get("/events").json()["latest"]
+    with api.sessions() as db:
+        first, second = (c.id for c in db.query(Chunk).order_by(Chunk.index).limit(2))
+    api.storage.data[("node1", first)] = b"XXXX"
+    api.client.post("/cluster/scrub")
+    api.storage.data[("node1", second)] = b"YYYY"
+    assert api.client.get("/files/sample.bin").content == b"abcdefghij"
+    body = api.client.get(f"/events?after={start}").json()
+    messages = [e["message"] for e in body["events"]]
+    assert body["latest"] == start + 2
+    assert messages[0].startswith("Integrity scan: the copy of chunk 0 of sample.bin (v1) on node1 failed")
+    assert (
+        messages[1]
+        == "Download found a bad copy of chunk 1 of sample.bin (v1) on node1; it used another copy"
+    )
+    assert api.client.get(f"/events?after={body['latest']}").json()["events"] == []
+    assert api.client.get("/events?after=-1").status_code == 422
+
+
 def test_dashboard_page_is_public_and_root_redirects_to_it(api, monkeypatch):
     monkeypatch.setenv("API_TOKEN", "client-secret")
     page = api.client.get("/ui")
@@ -795,6 +817,7 @@ def test_metrics_exposes_prometheus_text(api):
         ("/nodes", "get", {}),
         ("/cluster", "get", {}),
         ("/cluster/scrub", "post", {}),
+        ("/events", "get", {}),
         ("/metrics", "get", {}),
     ],
 )

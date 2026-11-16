@@ -553,3 +553,36 @@ def test_second_restart_during_revalidation_invalidates_entire_old_result(db, ol
     with httpx.Client(transport=httpx.MockTransport(lambda req: response_for(req, content=DATA))) as client:
         assert replicator.validate_recovering_nodes(db, client) == 1
     assert node.status == "ALIVE"
+
+
+def test_repairs_scrub_failures_and_lost_claims_are_recorded_as_events(db):
+    for name in ("source", "b", "c"):
+        add_node(db, name)
+    add_chunk(db, holders=("source",))
+    start = replicator.events_after(0)["latest"]
+    with httpx.Client(transport=httpx.MockTransport(good_receipt)) as client:
+        assert replicator.re_replicate(db, client, 3) == 2
+    repairs = replicator.events_after(start)["events"]
+    assert [(e["kind"], e["chunk_id"], e["node_id"]) for e in repairs] == [
+        ("ok", "chunk1", "b"),
+        ("ok", "chunk1", "c"),
+    ]
+    assert repairs[0]["message"] == "Repair: copied chunk 0 of chunk1.bin (v1) from source to b"
+
+    start = replicator.events_after(0)["latest"]
+    with httpx.Client(transport=httpx.MockTransport(lambda req: response_for(req, content=b"bad"))) as client:
+        assert replicator.verify_replicas(db, client)["removed"] == 3
+    scrubbed = replicator.events_after(start)["events"]
+    assert {(e["kind"], e["node_id"]) for e in scrubbed} == {("bad", "source"), ("bad", "b"), ("bad", "c")}
+    assert "the copy of chunk 0 of chunk1.bin (v1) on b failed its SHA-256 check" in scrubbed[0]["message"]
+
+
+def test_returning_node_lost_claim_is_recorded_as_event(db):
+    add_node(db, "returning", status="RECOVERING", chunk_count=1)
+    add_chunk(db, holders=("returning",))
+    start = replicator.events_after(0)["latest"]
+    with httpx.Client(transport=httpx.MockTransport(lambda req: response_for(req, 404))) as client:
+        assert replicator.validate_recovering_nodes(db, client) == 1
+    [event] = replicator.events_after(start)["events"]
+    assert event["message"] == "returning came back without a good copy of chunk 0 of chunk1.bin (v1)"
+    assert replicator.describe_chunk(db, "missing-chunk-id") == "chunk missing-"

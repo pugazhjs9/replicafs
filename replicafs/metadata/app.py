@@ -233,6 +233,12 @@ def scrub_now(db: Session = Depends(get_db)):
     return {"checked": result["checked"], "removed": result["removed"]}
 
 
+@app.get("/events", dependencies=API)
+def events(after: Annotated[int, Query(ge=0)] = 0):
+    """Recent integrity failures and repairs, for the dashboard's activity log."""
+    return replicator.events_after(after)
+
+
 @app.get("/metrics", response_class=PlainTextResponse, dependencies=API)
 def metrics(db: Session = Depends(get_db)):
     values = cluster_status(db)
@@ -507,7 +513,12 @@ def forget_replica(chunk_id: str, node_url: str) -> None:
             )
             if removed:
                 node.chunk_count = max(0, node.chunk_count - 1)
+                message = (
+                    f"Download found a bad copy of {replicator.describe_chunk(db, chunk_id)} on {node.id}"
+                )
             db.commit()
+            if removed:
+                replicator.record_event("bad", message + "; it used another copy", chunk_id, node.id)
 
 
 @app.delete("/files/{name}", dependencies=API)

@@ -160,7 +160,7 @@
         <div id="damage" class="picked-info">Click a green box in the chunk map to pick one stored copy.</div>
         <ol class="steps">
           <li>Copy the command and run it in the terminal. It changes a few bytes of that one copy directly on the node's disk, like a failing disk would. No error is raised.</li>
-          <li>Click <b>Check all copies now</b>. The SHA-256 check finds the bad copy and stops trusting it. (The background scan would find it within 30 s anyway.)</li>
+          <li>Click <b>Check all copies now</b>. The SHA-256 check finds the bad copy and stops trusting it. (Or just wait: the background scan re-checks every copy every 30 s, and what it finds also appears in Activity.)</li>
           <li>Within a few seconds, repair puts a good copy back from a healthy node. Download still matches ✓.</li>
         </ol>
         <p style="margin:10px 0 0"><button class="primary" id="scrubBtn">Check all copies now</button></p>
@@ -182,6 +182,7 @@
     token: store.get("rfs-token", ""), nodes: [], cluster: null, files: [], map: null, versions: [],
     selected: store.get("rfs-selected", null), deleted: store.get("rfs-deleted", []),
     prevStatus: {}, prevBeat: {}, prevUnder: null, prevCells: null, prevMapKey: null, flash: new Map(), started: false,
+    eventCursor: null,
   };
 
   function fmtBytes(n) {
@@ -235,6 +236,13 @@
     }
   }
 
+  function eventWhy(message) {
+    if (message.startsWith("Repair")) return "The target node pulled a copy from a healthy node and checked its SHA-256.";
+    if (message.startsWith("Integrity scan")) return "Every stored copy is re-checked by the background scan every 30 s, or right away with the Check button.";
+    if (message.startsWith("Download")) return "Downloads check every chunk's fingerprint, so a bad copy is never sent.";
+    return "Its disk no longer had a good copy, so the claim was removed before trusting the node again.";
+  }
+
   function diffCluster(c) {
     const under = c.under_replicated_chunks;
     if (state.prevUnder !== null && under !== state.prevUnder) {
@@ -252,13 +260,8 @@
     const cells = new Map();
     for (const chunk of map.placement) for (const r of chunk.replicas) cells.set(`${chunk.chunk_id}|${r.node_id}`, chunk.index);
     if (state.prevMapKey === key && state.prevCells) {
-      const added = {}, removed = {};
-      for (const [cell, index] of cells) if (!state.prevCells.has(cell)) {
-        const node = cell.split("|")[1]; (added[node] ||= []).push(index); state.flash.set(cell, Date.now() + 3500);
-      }
-      for (const [cell, index] of state.prevCells) if (!cells.has(cell)) { const node = cell.split("|")[1]; (removed[node] ||= []).push(index); }
-      for (const [node, list] of Object.entries(added)) log("ok", `Repair: copied chunk ${list.sort((a, b) => a - b).join(", ")} of ${map.name} to ${node}`, "The target node pulled a copy from a survivor and checked its SHA-256.");
-      for (const [node, list] of Object.entries(removed)) log("warn", `Dropped the copy of chunk ${list.sort((a, b) => a - b).join(", ")} on ${node}`, "That copy was missing or failed its checksum, so it is no longer trusted.");
+      // New copies flash; the server's event feed explains them in the log.
+      for (const cell of cells.keys()) if (!state.prevCells.has(cell)) state.flash.set(cell, Date.now() + 3500);
     }
     state.prevMapKey = key; state.prevCells = cells;
   }
@@ -315,7 +318,16 @@
           state.map = null;
         }
       }
-      // After the map diff, so individual repairs are logged before the summary.
+      // Server events catch scans and repairs that finish between two refreshes.
+      const feed = await getJSON(`/events?after=${state.eventCursor ?? 0}`);
+      if (state.eventCursor !== null && feed.latest >= state.eventCursor) {
+        for (const event of feed.events) {
+          log(event.kind, event.message, eventWhy(event.message));
+          if (event.kind === "ok" && event.chunk_id) state.flash.set(`${event.chunk_id}|${event.node_id}`, Date.now() + 3500);
+        }
+      }
+      state.eventCursor = feed.latest;
+      // After the repair events, so the summary comes last.
       diffCluster(cluster); state.cluster = cluster;
       state.started = true;
       setConn(true);
