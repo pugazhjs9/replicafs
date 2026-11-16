@@ -67,6 +67,10 @@
   .sq.DEAD { background: repeating-linear-gradient(45deg, #e6a29a, #e6a29a 4px, #f7d9d5 4px, #f7d9d5 8px); outline: 1.5px solid var(--bad); }
   .sq.RECOVERING { background: #f0c46a; }
   .sq.new { animation: flash 1s ease-in-out 3; }
+  .sq.ALIVE { cursor: pointer; }
+  .sq.picked { outline: 3px solid var(--ink); outline-offset: 2px; }
+  .picked-info { font-size: 13.5px; margin: 6px 0; }
+  .cmd code.long { font-size: 12px; word-break: break-all; }
   @keyframes flash { 0%,100% { box-shadow: 0 0 0 0 rgba(15,110,140,0); } 50% { box-shadow: 0 0 0 5px rgba(15,110,140,.55); } }
   .badge { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
   .badge.ok { background: var(--ok-soft); color: var(--ok); } .badge.warn { background: var(--warn-soft); color: var(--warn); } .badge.bad { background: var(--bad-soft); color: var(--bad); }
@@ -120,6 +124,7 @@
           <span><i class="sq DEAD"></i> copy on a DEAD node (not trusted)</span>
           <span><i class="sq RECOVERING"></i> being re-verified</span>
           <span><i class="sq"></i> no copy</span>
+          <span>Click a green box to pick that copy for the disk-damage demo.</span>
         </div>
       </section>
       <section class="panel">
@@ -149,6 +154,16 @@
           <li>Click Download: the SHA-256 still matches, with node2 down.</li>
           <li>Run the start command: node2 goes RECOVERING, then ALIVE.</li>
         </ol>
+      </section>
+      <section class="panel">
+        <h2>Simulate silent disk damage</h2>
+        <div id="damage" class="picked-info">Click a green box in the chunk map to pick one stored copy.</div>
+        <ol class="steps">
+          <li>Copy the command and run it in the terminal. It changes a few bytes of that one copy directly on the node's disk, like a failing disk would. No error is raised.</li>
+          <li>Click <b>Check all copies now</b>. The SHA-256 check finds the bad copy and stops trusting it. (The background scan would find it within 30 s anyway.)</li>
+          <li>Within a few seconds, repair puts a good copy back from a healthy node. Download still matches ✓.</li>
+        </ol>
+        <p style="margin:10px 0 0"><button class="primary" id="scrubBtn">Check all copies now</button></p>
       </section>
     </div>
   </div>
@@ -248,7 +263,28 @@
     state.prevMapKey = key; state.prevCells = cells;
   }
 
+  function renderDamage() {
+    const el = $("#damage"), p = state.pick;
+    if (!p) { el.innerHTML = "Click a green box in the chunk map to pick one stored copy."; return; }
+    const command = `docker compose exec ${p.node} sh -c 'printf CORRUPTED | dd of=/data/${p.chunk} conv=notrunc status=none'`;
+    el.innerHTML = `Picked: <b>chunk ${p.index}</b> of <b>${esc(p.name)}</b> on <b>${esc(p.node)}</b>
+      <div class="cmd"><code class="long">${esc(command)}</code><button class="act" data-copy="${esc(command)}">Copy</button></div>`;
+  }
+
+  async function scrubNow() {
+    const button = $("#scrubBtn"); button.disabled = true;
+    try {
+      const result = await (await api("/cluster/scrub", { method: "POST" })).json();
+      log(result.removed ? "bad" : "ok", `Integrity check: ${result.checked} stored copies checked, ${result.removed} failed the SHA-256 check`,
+        result.removed ? "A bad copy is no longer trusted. The monitor re-copies the chunk from a good copy within a few seconds." : "Every stored copy still matches its fingerprint.");
+      state.pick = null; renderDamage();
+      refresh();
+    } catch (error) { log("bad", `Integrity check failed: ${error.message}`); }
+    finally { button.disabled = false; }
+  }
+
   function select(name, version = null) {
+    state.pick = null; renderDamage();
     state.selected = { name, version }; store.set("rfs-selected", state.selected);
     state.prevMapKey = null; state.prevCells = null; state.map = null; state.versions = [];
     render(); refresh();
@@ -380,7 +416,9 @@
       const cells = nodeIds.map((id) => {
         const status = byNode[id];
         const isNew = (state.flash.get(`${chunk.chunk_id}|${id}`) || 0) > now;
-        return `<td class="cell"><i class="sq ${status ? esc(status) : ""} ${isNew ? "new" : ""}" title="${status ? esc(id + ": " + status) : "no copy"}"></i></td>`;
+        const picked = state.pick && state.pick.chunk === chunk.chunk_id && state.pick.node === id;
+        const pickable = status === "ALIVE" ? ` data-chunk="${esc(chunk.chunk_id)}" data-index="${chunk.index}" data-node="${esc(id)}"` : "";
+        return `<td class="cell"><i class="sq ${status ? esc(status) : ""} ${isNew ? "new" : ""} ${picked ? "picked" : ""}"${pickable} title="${status ? esc(id + ": " + status) : "no copy"}"></i></td>`;
       }).join("");
       const label = count > m.replication_factor ? `${count} live (target ${m.replication_factor})` : `${count} of ${m.replication_factor} live`;
       return `<tr><td>chunk ${chunk.index}</td><td>${esc(fmtBytes(chunk.size))}</td>${cells}<td><span class="badge ${kind}">${label}</span></td></tr>`;
@@ -464,7 +502,13 @@
   }
 
   document.addEventListener("click", (event) => {
+    const cell = event.target.closest(".sq[data-node]");
+    if (cell && state.map) {
+      state.pick = { chunk: cell.dataset.chunk, index: Number(cell.dataset.index), node: cell.dataset.node, name: state.map.name };
+      renderDamage(); renderMap(); return;
+    }
     const t = event.target.closest("button"); if (!t) return;
+    if (t.id === "scrubBtn") { scrubNow(); return; }
     if (t.dataset.show) select(t.dataset.show);
     else if (t.dataset.version) select(state.selected.name, Number(t.dataset.version));
     else if (t.dataset.dl) download(t.dataset.dl, t.dataset.v ? Number(t.dataset.v) : null);

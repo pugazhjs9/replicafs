@@ -29,6 +29,7 @@ Authorization: Bearer your-token-value
 | POST | `/files/{name}/restore` | API | Restore all deleted versions of that name. |
 | GET | `/nodes` | API | Node addresses, heartbeat times, capacity/load, and state. |
 | GET | `/cluster` | API | File/chunk/replica counts and replication health. |
+| POST | `/cluster/scrub` | API | Check every live copy against its SHA-256 now (instead of waiting for the periodic scan); returns how many were checked and dropped. |
 | GET | `/metrics` | API | Prometheus text metrics for monitoring integrations. |
 | POST | `/nodes/heartbeat` | Cluster | Register/update a node and its heartbeat. |
 

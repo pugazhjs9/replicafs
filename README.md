@@ -69,6 +69,8 @@ Keep that terminal open. Run the same `curl` commands in a second terminal. Ctrl
 
 Open **http://127.0.0.1:8000/ui** for a live dashboard. It refreshes every second and shows node heartbeats and states, a chunk map (which node holds each copy of each chunk), and an activity log. You can upload, download (the browser re-checks the SHA-256), browse versions, delete and restore files there. Stop a node with `docker compose stop node2` and watch it turn DEAD after the timeout, then watch new copies appear on the other nodes. Run `docker compose start node2` to see it go through RECOVERING back to ALIVE.
 
+To show silent corruption, click a green box in the chunk map. The page shows a `docker compose exec` command that overwrites a few bytes of that copy on the node's disk. Run it, then click **Check all copies now**: the SHA-256 check stops trusting the damaged copy, and repair puts a good copy back.
+
 ## Demonstrate failure recovery
 
 With the Docker cluster running:

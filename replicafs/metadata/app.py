@@ -220,6 +220,19 @@ def cluster_status(db: Session = Depends(get_db)):
     }
 
 
+@app.post("/cluster/scrub", dependencies=API)
+def scrub_now(db: Session = Depends(get_db)):
+    """Check every live copy against its checksum now instead of waiting for the periodic scan.
+
+    Bad copies stop counting; the monitor's next repair pass replaces them.
+    """
+    expire_nodes(db)
+    total = db.query(Replica).count()
+    db.rollback()
+    result = replicator.verify_replicas(db, client, max(1, total))
+    return {"checked": result["checked"], "removed": result["removed"]}
+
+
 @app.get("/metrics", response_class=PlainTextResponse, dependencies=API)
 def metrics(db: Session = Depends(get_db)):
     values = cluster_status(db)

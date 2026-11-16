@@ -748,6 +748,21 @@ def test_chunk_map_follows_versions_and_soft_delete(api):
     assert api.client.get("/files/sample.bin/chunks?version=1").status_code == 404
 
 
+def test_on_demand_scrub_drops_only_the_silently_corrupted_copy(api):
+    api.nodes()
+    assert api.upload(b"abcdefghij").status_code == 201
+    assert api.client.post("/cluster/scrub").json() == {"checked": 9, "removed": 0}
+    with api.sessions() as db:
+        chunk = db.query(Chunk).filter(Chunk.index == 0).one()
+        chunk_id = chunk.id
+    api.storage.data[("node1", chunk_id)] = b"XXXX"
+    assert api.client.post("/cluster/scrub").json() == {"checked": 9, "removed": 1}
+    placement = api.client.get("/files/sample.bin/chunks").json()["placement"]
+    assert [r["node_id"] for r in placement[0]["replicas"]] == ["node2", "node3"]
+    assert all(len(c["replicas"]) == 3 for c in placement[1:])
+    assert api.client.get("/files/sample.bin").content == b"abcdefghij"
+
+
 def test_dashboard_page_is_public_and_root_redirects_to_it(api, monkeypatch):
     monkeypatch.setenv("API_TOKEN", "client-secret")
     page = api.client.get("/ui")
@@ -779,6 +794,7 @@ def test_metrics_exposes_prometheus_text(api):
         ("/files/absent/restore", "post", {}),
         ("/nodes", "get", {}),
         ("/cluster", "get", {}),
+        ("/cluster/scrub", "post", {}),
         ("/metrics", "get", {}),
     ],
 )
