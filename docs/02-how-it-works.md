@@ -62,6 +62,17 @@ The standard storage process sends `restarted=true` on its first successful star
 
 This handles both a wiped disk and an ordinary restart with intact data. It also supports recovery after all storage nodes have been unavailable: surviving bytes can be validated instead of losing their map. Arbitrary orphan files without retained metadata claims are not automatically inventoried.
 
+## Extra copies are trimmed
+
+While node2 was DEAD, repair made a third copy of its chunks on another node. If node2's disk was intact, its old copies pass the recovery check, so some chunks now have four live copies. Extra copies are safe but waste disk, so the monitor trims them back to the target:
+
+1. Count only live copies on ALIVE nodes. Copies on DEAD or RECOVERING nodes are untrusted and never counted or deleted.
+2. Try copies on the least-loaded nodes first and read each one, until three pass a fresh SHA-256 check. Those three are kept. Every other live copy is surplus, so extras come off the busiest disks.
+3. If fewer than three copies prove good (corrupt, missing or unreachable), delete nothing. Trimming must never push a chunk below the target.
+4. Delete the surplus replica row and commit, then ask the node to delete the bytes. A crash in between leaves an unreferenced file, never a row pointing at missing bytes. If the delete request fails, the file stays as an orphan.
+
+The database step rechecks that every keeper is still ALIVE, has a fresh heartbeat and still holds its row. It takes the database write lock while doing so, so a node expiring or a download dropping a bad copy at the same moment cancels the trim until the next pass. A download that planned to read the removed copy gets a 404 from that node and falls back to the next copy.
+
 A registered node address is immutable: changing `NODE_URL` for the same `NODE_ID` returns 409. A new address needs a new node identity; it does not automatically adopt the old identity's claims. Use a stable DNS name/address across restarts. Never run two different storage nodes with the same `NODE_ID`.
 
 ## A disk silently changes bytes

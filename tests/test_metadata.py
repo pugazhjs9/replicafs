@@ -691,6 +691,7 @@ def test_cluster_counts_logical_files_separately_from_versions(api):
     assert status["nodes_alive"] == 3
     assert status["under_replicated_chunks"] == 0
     assert status["unavailable_chunks"] == 0
+    assert status["over_replicated_chunks"] == 0
     api.client.delete("/files/sample.bin")
     status = api.client.get("/cluster").json()
     assert status["files"] == 1

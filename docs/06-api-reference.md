@@ -88,7 +88,7 @@ An existing node returning after expiry or advertising `restarted=true` has its 
 A restart increases an internal recovery counter. A check started before another
 restart cannot approve that newer process using the previous process's results.
 
-`under_replicated_chunks` includes chunks below the target, including zero live copies. `unavailable_chunks` counts those with zero usable live copies. A chunk with two live copies and target three is under-replicated but available. A zero-copy chunk is both under-replicated and unavailable. Total recorded replicas and live replicas can differ while a node is DEAD or RECOVERING.
+`under_replicated_chunks` includes chunks below the target, including zero live copies. `unavailable_chunks` counts those with zero usable live copies. A chunk with two live copies and target three is under-replicated but available. A zero-copy chunk is both under-replicated and unavailable. Total recorded replicas and live replicas can differ while a node is DEAD or RECOVERING. `over_replicated_chunks` counts chunks with more live copies than the target, usually right after a node returns. The monitor trims them back within a pass or two, so a lasting non-zero value means the extras could not be proven safe to remove.
 
 ## Settings
 

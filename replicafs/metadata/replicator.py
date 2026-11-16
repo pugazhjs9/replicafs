@@ -1,7 +1,8 @@
-"""Failure detection, bounded checksum scrubbing, and best-effort replica repair.
+"""Failure detection, bounded checksum scrubbing, replica repair and trimming.
 
 Timeouts make claims untrusted; returning nodes must pass revalidation before
-ALIVE. Retained claims permit recovery after a complete outage. Each monitor
+ALIVE. Retained claims permit recovery after a complete outage, and copies
+beyond the target are trimmed once enough others are proven good. Each monitor
 operation snapshots metadata, releases its read transaction, performs HTTP I/O,
 then commits short mutations so slow storage never holds a database write lock.
 """
@@ -14,7 +15,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import httpx
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from replicafs.metadata.db import Chunk, File, Node, Replica, utcnow
@@ -210,7 +211,13 @@ def under_replicated_chunks(db: Session, rf: int):
 def replication_health(db: Session, rf: int) -> dict[str, int]:
     """Count redundancy honestly, including chunks with no reachable copies."""
     alive_ids = {n.id for n in db.query(Node).filter(Node.status == "ALIVE")}
-    health = {"under_replicated_chunks": 0, "unavailable_chunks": 0, "healthy_chunks": 0, "live_replicas": 0}
+    health = {
+        "under_replicated_chunks": 0,
+        "unavailable_chunks": 0,
+        "healthy_chunks": 0,
+        "over_replicated_chunks": 0,
+        "live_replicas": 0,
+    }
     for chunk in db.query(Chunk):
         count = sum(r.node_id in alive_ids for r in chunk.replicas)
         health["live_replicas"] += count
@@ -218,6 +225,8 @@ def replication_health(db: Session, rf: int) -> dict[str, int]:
             health["under_replicated_chunks"] += 1
         else:
             health["healthy_chunks"] += 1
+        if count > rf:
+            health["over_replicated_chunks"] += 1
         if count == 0:
             health["unavailable_chunks"] += 1
     return health
@@ -312,6 +321,109 @@ def re_replicate(db: Session, client: httpx.Client, rf: int) -> int:
     for message, chunk_id, node_id in events:
         record_event("ok", message, chunk_id, node_id)
     return fixed
+
+
+def trim_over_replicated(db: Session, client: httpx.Client, rf: int, dead_after_seconds: float) -> int:
+    """Delete live copies beyond ``rf`` once ``rf`` other copies have just proven their bytes.
+
+    Extra copies appear when a node that was repaired around comes back and its
+    old copies pass revalidation. Keepers are tried least-loaded node first and
+    must each pass a fresh SHA-256 read; every other live copy is surplus. With
+    fewer than ``rf`` proven keepers nothing is deleted, so trimming can never
+    push a chunk below the target. Copies on DEAD or RECOVERING nodes are not
+    counted and never touched.
+
+    The replica row is committed away before the bytes are deleted. A crash
+    between the two steps leaves an unreferenced file on a disk, never a record
+    that points at missing bytes.
+    """
+    alive = {
+        node.id: SimpleNamespace(url=node.url, chunk_count=node.chunk_count)
+        for node in db.query(Node).filter(Node.status == "ALIVE")
+    }
+    over = (
+        db.query(Replica.chunk_id)
+        .join(Node)
+        .filter(Node.status == "ALIVE")
+        .group_by(Replica.chunk_id)
+        .having(func.count() > rf)
+        .order_by(Replica.chunk_id)
+        .all()
+    )
+    plans = []
+    for (chunk_id,) in over:
+        chunk = db.get(Chunk, chunk_id)
+        holders = [r.node_id for r in chunk.replicas if r.node_id in alive]
+        plans.append((chunk.id, chunk.checksum, chunk.size, holders))
+    db.rollback()
+
+    decisions = []
+    for chunk_id, checksum, size, holders in plans:
+        keepers = []
+        # Read only until rf copies are proven; the busiest disks give up copies.
+        for node_id in sorted(holders, key=lambda n: (alive[n].chunk_count, n)):
+            if len(keepers) == rf:
+                break
+            try:
+                if bounded_verified_read(client, f"{alive[node_id].url}/chunks/{chunk_id}", checksum, size):
+                    keepers.append(node_id)
+            except httpx.HTTPError as exc:
+                log.warning("trim could not verify chunk %s on %s: %s", chunk_id, node_id, exc)
+        if len(keepers) < rf:
+            log.info("chunk %s has only %d proven copies; not trimming", chunk_id[:8], len(keepers))
+            continue
+        surplus = [node_id for node_id in holders if node_id not in keepers]
+        for node_id in surplus:
+            alive[node_id].chunk_count -= 1
+        decisions.append((chunk_id, keepers, surplus))
+
+    cutoff = utcnow() - timedelta(seconds=dead_after_seconds)
+    trimmed = []
+    for chunk_id, keepers, surplus in decisions:
+        # The conditional no-op UPDATE takes the database write lock until
+        # commit, so no expiry, restart, scrub or failed download can remove a
+        # keeper between this check and the deletion. No HTTP runs under it.
+        fenced = (
+            db.query(Node)
+            .filter(Node.id.in_(keepers), Node.status == "ALIVE", Node.last_heartbeat >= cutoff)
+            .update({Node.status: Node.status}, synchronize_session=False)
+        )
+        kept = db.query(Replica).filter(Replica.chunk_id == chunk_id, Replica.node_id.in_(keepers)).count()
+        if fenced != len(keepers) or kept != len(keepers):
+            db.rollback()
+            log.info("keepers of chunk %s changed during the trim check; retrying next pass", chunk_id[:8])
+            continue
+        where = ", ".join(sorted(keepers))
+        for node_id in surplus:
+            deleted = (
+                db.query(Replica)
+                .filter(Replica.chunk_id == chunk_id, Replica.node_id == node_id)
+                .delete(synchronize_session=False)
+            )
+            if deleted:
+                node = db.get(Node, node_id)
+                node.chunk_count = max(0, node.chunk_count - deleted)
+                message = (
+                    f"Trim: removed the extra copy of {describe_chunk(db, chunk_id)} from {node_id}; "
+                    f"{rf} checked copies remain on {where}"
+                )
+                trimmed.append((chunk_id, node_id, message))
+        db.commit()
+    db.expire_all()
+
+    for chunk_id, node_id, message in trimmed:
+        try:
+            response = client.delete(
+                f"{alive[node_id].url}/chunks/{chunk_id}", headers=cluster_headers(), timeout=10
+            )
+            response.raise_for_status()
+            log.info("trimmed extra copy of chunk %s from %s", chunk_id[:8], node_id)
+        except httpx.HTTPError as exc:
+            log.warning(
+                "chunk %s is no longer referenced on %s but its file remains: %s", chunk_id, node_id, exc
+            )
+        record_event("ok", message, chunk_id, node_id)
+    return len(trimmed)
 
 
 def verify_replicas(

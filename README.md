@@ -89,6 +89,7 @@ The script uploads a multi-chunk file, stops node2, verifies the downloaded byte
 | Replication | Copies on separate node identities, least-loaded placement, and retry of alternate nodes. |
 | Failure detection | Periodic heartbeats; expired nodes stop counting as live; returning disks are verified before trust. |
 | Repair | A background monitor recreates missing copies from surviving verified data. |
+| Trimming | When a returning node leaves a chunk with more live copies than the target, extras are deleted after enough others pass a fresh checksum read. |
 | Integrity | SHA-256 per chunk and whole file; corrupt or missing copies are excluded and repaired. |
 | Safe downloads | Data is verified before a successful response is sent; unavailable data returns an HTTP error. |
 | Version history | Repeated uploads under one name create numbered versions; earlier versions remain downloadable. |

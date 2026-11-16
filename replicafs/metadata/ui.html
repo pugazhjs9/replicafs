@@ -22,7 +22,7 @@
   .conn.down i { background: #ff6b5b; }
   header button { background: transparent; color: #d5e9f0; border: 1px solid #4b7486; border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit; font-size: 13px; }
   main { padding: 18px 24px 40px; max-width: 1500px; margin: 0 auto; }
-  .stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 16px; }
+  .stats { display: grid; grid-template-columns: repeat(7, 1fr); gap: 12px; margin-bottom: 16px; }
   .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
   .stat b { display: block; font-size: 26px; line-height: 1.15; }
   .stat span { color: var(--muted); font-size: 13px; }
@@ -98,7 +98,7 @@
   ol.steps { margin: 8px 0 0; padding-left: 20px; font-size: 13.5px; color: var(--muted); }
   ol.steps li { margin-bottom: 3px; }
   .status { font-size: 13.5px; color: var(--muted); }
-  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(4, 1fr); } }
   @media (max-width: 760px) { .nodes { grid-template-columns: repeat(2, 1fr); } main { padding: 12px; } }
 </style>
 </head>
@@ -181,7 +181,7 @@
   const state = {
     token: store.get("rfs-token", ""), nodes: [], cluster: null, files: [], map: null, versions: [],
     selected: store.get("rfs-selected", null), deleted: store.get("rfs-deleted", []),
-    prevStatus: {}, prevBeat: {}, prevUnder: null, prevCells: null, prevMapKey: null, flash: new Map(), started: false,
+    prevStatus: {}, prevBeat: {}, prevUnder: null, prevOver: null, prevCells: null, prevMapKey: null, flash: new Map(), started: false,
     eventCursor: null,
   };
 
@@ -239,6 +239,7 @@
   function eventWhy(message) {
     if (message.startsWith("Repair")) return "The target node pulled a copy from a healthy node and checked its SHA-256.";
     if (message.startsWith("Integrity scan")) return "Every stored copy is re-checked by the background scan every 30 s, or right away with the Check button.";
+    if (message.startsWith("Trim")) return "The 3 copies it keeps passed a fresh SHA-256 check first. The database row is removed before the bytes, so the map never points at a missing copy.";
     if (message.startsWith("Download")) return "Downloads check every chunk's fingerprint, so a bad copy is never sent.";
     return "Its disk no longer had a good copy, so the claim was removed before trusting the node again.";
   }
@@ -253,6 +254,11 @@
       log("bad", `${c.unavailable_chunks} chunk(s) have no live copy`, "Downloads that need them return 503 until a holder returns.");
     }
     state.prevUnder = under;
+    const over = c.over_replicated_chunks || 0;
+    if (state.prevOver !== null && over > state.prevOver) {
+      log("info", `${over} chunk(s) now have more than ${c.replication_factor} live copies`, "A returning node's old copies passed their check. The monitor trims the extras within a few seconds.");
+    }
+    state.prevOver = over;
   }
 
   function diffMap(map) {
@@ -358,6 +364,7 @@
       ["Chunks fully replicated", `${c.healthy_chunks}/${c.chunks}`, c.healthy_chunks === c.chunks ? "ok" : "warn"],
       ["Under-replicated chunks", c.under_replicated_chunks, c.under_replicated_chunks ? "warn" : "ok"],
       ["Unavailable chunks", c.unavailable_chunks, c.unavailable_chunks ? "bad" : "ok"],
+      ["Chunks with extra copies", c.over_replicated_chunks || 0, c.over_replicated_chunks ? "warn" : "ok"],
       ["Live copies stored", c.live_replicas, ""],
     ];
     $("#stats").innerHTML = tiles.map(([label, value, kind]) => `<div class="stat ${kind}"><b>${esc(value)}</b><span>${esc(label)}</span></div>`).join("");
@@ -432,7 +439,7 @@
         const pickable = status === "ALIVE" ? ` data-chunk="${esc(chunk.chunk_id)}" data-index="${chunk.index}" data-node="${esc(id)}"` : "";
         return `<td class="cell"><i class="sq ${status ? esc(status) : ""} ${isNew ? "new" : ""} ${picked ? "picked" : ""}"${pickable} title="${status ? esc(id + ": " + status) : "no copy"}"></i></td>`;
       }).join("");
-      const label = count > m.replication_factor ? `${count} live (target ${m.replication_factor})` : `${count} of ${m.replication_factor} live`;
+      const label = count > m.replication_factor ? `${count} live: ${count - m.replication_factor} extra, trimming` : `${count} of ${m.replication_factor} live`;
       return `<tr><td>chunk ${chunk.index}</td><td>${esc(fmtBytes(chunk.size))}</td>${cells}<td><span class="badge ${kind}">${label}</span></td></tr>`;
     }).join("");
     map.innerHTML = `<table><thead><tr><th>Chunk</th><th>Size</th>${nodeIds.map((id) => `<th style="text-align:center">${esc(id)}</th>`).join("")}<th>Copies</th></tr></thead><tbody>${rows}</tbody></table>`;

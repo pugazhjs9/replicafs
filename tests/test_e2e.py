@@ -301,6 +301,31 @@ def test_download_survives_node_failure_and_cluster_self_heals(cluster):
     assert cluster.download("big.bin").content == data
 
 
+def test_returning_node_extra_copies_are_trimmed_back_to_target(cluster):
+    data = os.urandom(CHUNK_SIZE * 3 + 1)
+    cluster.upload("trim.bin", data)
+    victim = cluster.replicas("trim.bin")[0][3]
+    cluster.kill_node(victim)
+    cluster.wait(lambda: cluster.nodes()[victim] == "DEAD", 10, "victim marked DEAD")
+    cluster.wait(lambda: cluster.replicas_valid("trim.bin"), 15, "repair onto the spare node")
+    cluster.start_node(victim)
+    cluster.wait(lambda: cluster.nodes()[victim] == "ALIVE", 15, "returning node revalidated")
+
+    def exactly_three_everywhere():
+        live = [row for row in cluster.replicas("trim.bin") if row[4] == "ALIVE"]
+        on_disk = sum(len(cluster.local_chunks(name)) for name in cluster.node_env)
+        return (
+            cluster.cluster()["over_replicated_chunks"] == 0
+            and len(live) == 4 * 3
+            and on_disk == 4 * 3
+            and cluster.replicas_valid("trim.bin")
+        )
+
+    # Rows and bytes both return to the target: the extra files are really gone.
+    cluster.wait(exactly_three_everywhere, 15, "extra copies trimmed from metadata and disk")
+    assert cluster.download("trim.bin").content == data
+
+
 def test_corrupted_replica_is_detected_and_bypassed(cluster):
     cluster.restart_metadata(SCRUB_INTERVAL="3600")
     data = os.urandom(CHUNK_SIZE + 5)

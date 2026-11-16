@@ -65,13 +65,15 @@ upgrades to existing SQLite databases without deleting their file records.
 
 `re_replicate` chooses destinations that do not already hold the chunk. It retries sources and targets on failure, supplies the cluster token, and records a placement only after a valid destination response. Capacity `-1` means unknown, `0` means full, and positive reports constrain placement. It must not count an HTTP error or malformed acknowledgement as a stored copy.
 
+`trim_over_replicated` handles the opposite case: more live copies than the target, which happens when a node that was repaired around returns with intact data. It reads copies least-loaded node first until the target number pass a fresh checksum check. It keeps those and treats every other live copy as surplus. Without enough proven keepers it deletes nothing. It deletes surplus rows in a fenced transaction, then deletes the bytes. A crash in between can leave an orphan file but never a row that points at missing data.
+
 `verify_replicas` checks a bounded batch for actual size and checksum. Definitive 404/corruption removes a placement; a timeout alone does not prove the bytes are damaged. Batches rotate so an unchanged early part of the table does not permanently starve later replicas.
 
 ## Metadata API: `replicafs/metadata/app.py`
 
 `get_db` gives each request its own database session and closes it afterward. Request handlers perform blocking database and HTTP work in ordinary `def` handlers, which FastAPI runs in a thread pool.
 
-Startup initializes the schema and monitor; shutdown signals the monitor to stop and closes network resources. The monitor performs health detection, bounded integrity checks, and repair. Exceptions are logged and the loop continues; a transient error should not permanently stop self-healing.
+Startup initializes the schema and monitor; shutdown signals the monitor to stop and closes network resources. The monitor performs health detection, bounded integrity checks, repair, and trimming of extra copies. Exceptions are logged and the loop continues; a transient error should not permanently stop self-healing.
 
 The raw request-body guard limits incoming metadata requests to `MAX_FILE_BYTES + 64 KiB`, including streamed requests without `Content-Length`, before multipart processing can spool unlimited data. The upload handler then checks the file-content limit, write policy, node selection, cleanup list, version allocation, and final commit. `attempted` keeps enough information to attempt deleting bytes from an abandoned write, including a write whose acknowledgement was lost. It cannot undo a remote write on a currently unreachable node.
 

@@ -73,6 +73,7 @@ def monitor_loop(stop: threading.Event) -> None:
                     cursor = result["next_cursor"]
                     next_scrub = time.monotonic() + SCRUB_INTERVAL
                 replicator.re_replicate(db, client, REPLICATION_FACTOR)
+                replicator.trim_over_replicated(db, client, REPLICATION_FACTOR, DEAD_AFTER_SECONDS)
         except Exception:
             log.exception("monitor pass failed; retrying next interval")
         stop.wait(MONITOR_INTERVAL)

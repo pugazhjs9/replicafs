@@ -46,6 +46,10 @@ A streamed response sends its status first. If a later chunk is unavailable, the
 
 Timeout detection makes its retained placement claims untrusted. A returning heartbeat sets RECOVERING; the standard node also sends a startup flag so even a fast restart triggers checking. The monitor checks those claims against bytes on disk before allowing ALIVE. Missing/corrupt claims are removed. Valid disks can also recover after a full storage outage. Arbitrary orphan bytes without metadata are not automatically recovered.
 
+## “What happens to the extra copy when a node comes back?”
+
+While the node was down, repair made a replacement copy elsewhere. When the node returns with intact data, its old copy passes the recovery check, so the chunk has four live copies. The monitor then trims back to three. It reads copies on the least-loaded nodes until three pass a SHA-256 check, keeps those, and deletes the rest from the busiest disks. If three can't be proven, it deletes nothing. It removes the database row before the bytes, so metadata never points at a deleted copy. At worst a crash leaves an orphan file.
+
 ## “How do simultaneous uploads get different versions?”
 
 The metadata process serializes the relevant mutation and the database also has a uniqueness constraint. One worker is the supported configuration. Multiple independent coordinators would need a database-backed allocation/locking strategy and a coordinated background repair owner.

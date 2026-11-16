@@ -118,6 +118,7 @@ def test_complete_outage_revalidates_surviving_disk_data(db):
         "under_replicated_chunks": 0,
         "unavailable_chunks": 0,
         "healthy_chunks": 1,
+        "over_replicated_chunks": 0,
         "live_replicas": 3,
     }
 
@@ -200,6 +201,7 @@ def test_health_counts_unavailable_under_replicated_and_extra_copies(db):
         "under_replicated_chunks": 2,
         "unavailable_chunks": 1,
         "healthy_chunks": 2,
+        "over_replicated_chunks": 1,
         "live_replicas": 8,
     }
     assert [chunk.id for chunk, _ in replicator.under_replicated_chunks(db, 3)] == ["partial"]
@@ -210,6 +212,7 @@ def test_empty_cluster_health(db):
         "under_replicated_chunks": 0,
         "unavailable_chunks": 0,
         "healthy_chunks": 0,
+        "over_replicated_chunks": 0,
         "live_replicas": 0,
     }
 
@@ -586,3 +589,148 @@ def test_returning_node_lost_claim_is_recorded_as_event(db):
     [event] = replicator.events_after(start)["events"]
     assert event["message"] == "returning came back without a good copy of chunk 0 of chunk1.bin (v1)"
     assert replicator.describe_chunk(db, "missing-chunk-id") == "chunk missing-"
+
+
+def trim_peer(calls, bad=(), unreachable=(), on_get=None, on_delete=None):
+    """A fake cluster: GET serves chunk bytes, DELETE removes a copy."""
+
+    def handler(request):
+        host = request.url.host
+        calls.append((request.method, host))
+        if host in unreachable:
+            raise httpx.ConnectError("node unreachable", request=request)
+        if request.method == "DELETE":
+            return on_delete(request) if on_delete else response_for(request, json={"deleted": "chunk1"})
+        if on_get:
+            on_get(host)
+        return response_for(request, content=b"corrupt" if host in bad else DATA)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_trim_keeps_least_loaded_proven_copies_and_deletes_the_busiest(db, monkeypatch):
+    monkeypatch.setattr(replicator, "cluster_headers", lambda: {"Authorization": "Bearer secret"})
+    for name, load in (("a", 1), ("b", 2), ("c", 3), ("d", 9)):
+        add_node(db, name, chunk_count=load)
+    add_chunk(db, holders=("a", "b", "c", "d"))
+    assert replicator.replication_health(db, 3)["over_replicated_chunks"] == 1
+    start = replicator.events_after(0)["latest"]
+    calls = []
+    with trim_peer(calls) as client:
+        assert replicator.trim_over_replicated(db, client, 3, 10) == 1
+        # Proven keepers are read once; the surplus copy is deleted, not read.
+        assert calls == [("GET", "a"), ("GET", "b"), ("GET", "c"), ("DELETE", "d")]
+        assert replicator.trim_over_replicated(db, client, 3, 10) == 0
+    assert len(calls) == 4
+    assert {row.node_id for row in db.query(Replica)} == {"a", "b", "c"}
+    assert db.get(Node, "d").chunk_count == 8
+    assert replicator.replication_health(db, 3)["over_replicated_chunks"] == 0
+    [event] = replicator.events_after(start)["events"]
+    assert (event["kind"], event["chunk_id"], event["node_id"]) == ("ok", "chunk1", "d")
+    assert event["message"] == (
+        "Trim: removed the extra copy of chunk 0 of chunk1.bin (v1) from d; 3 checked copies remain on a, b, c"
+    )
+
+
+def test_trim_removes_every_surplus_copy_down_to_the_target(db):
+    for name, load in (("a", 0), ("b", 0), ("c", 5), ("d", 6)):
+        add_node(db, name, chunk_count=load)
+    add_chunk(db, holders=("a", "b", "c", "d"))
+    calls = []
+    with trim_peer(calls) as client:
+        assert replicator.trim_over_replicated(db, client, 2, 10) == 2
+    assert {row.node_id for row in db.query(Replica)} == {"a", "b"}
+    assert sorted(call for call in calls if call[0] == "DELETE") == [("DELETE", "c"), ("DELETE", "d")]
+
+
+def test_trim_replaces_a_bad_keeper_and_drops_the_bad_copy_as_surplus(db):
+    for name, load in (("a", 0), ("b", 1), ("c", 2), ("d", 3)):
+        add_node(db, name, chunk_count=load)
+    add_chunk(db, holders=("a", "b", "c", "d"))
+    calls = []
+    with trim_peer(calls, bad={"a"}) as client:
+        assert replicator.trim_over_replicated(db, client, 3, 10) == 1
+    assert calls == [("GET", "a"), ("GET", "b"), ("GET", "c"), ("GET", "d"), ("DELETE", "a")]
+    assert {row.node_id for row in db.query(Replica)} == {"b", "c", "d"}
+
+
+@pytest.mark.parametrize(
+    "faults", [{"bad": {"a", "b"}}, {"unreachable": {"a", "b"}}, {"bad": {"a"}, "unreachable": {"b"}}]
+)
+def test_trim_never_cuts_below_target_without_enough_proven_copies(db, faults):
+    for name, load in (("a", 0), ("b", 1), ("c", 2), ("d", 3)):
+        add_node(db, name, chunk_count=load)
+    add_chunk(db, holders=("a", "b", "c", "d"))
+    calls = []
+    with trim_peer(calls, **faults) as client:
+        assert replicator.trim_over_replicated(db, client, 3, 10) == 0
+    assert all(method == "GET" for method, _ in calls)
+    assert db.query(Replica).count() == 4
+
+
+def test_trim_counts_only_alive_copies_and_never_touches_untrusted_ones(db):
+    for name in ("a", "b", "c"):
+        add_node(db, name)
+    add_node(db, "dead", status="DEAD")
+    add_node(db, "returning", status="RECOVERING")
+    add_chunk(db, holders=("a", "b", "c", "dead", "returning"))
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda req: pytest.fail("a chunk at its target must not be read"))
+    ) as client:
+        assert replicator.trim_over_replicated(db, client, 3, 10) == 0
+    assert db.query(Replica).count() == 5
+
+
+def expire_keeper(db, host):
+    db.query(Node).filter(Node.id == host).update({Node.status: "DEAD"})
+    db.commit()
+
+
+def heartbeat_goes_stale(db, host):
+    db.query(Node).filter(Node.id == host).update({Node.last_heartbeat: utcnow() - timedelta(seconds=60)})
+    db.commit()
+
+
+def download_drops_keeper_claim(db, host):
+    db.query(Replica).filter(Replica.node_id == host).delete()
+    db.commit()
+
+
+@pytest.mark.parametrize("change", [expire_keeper, heartbeat_goes_stale, download_drops_keeper_claim])
+def test_keeper_change_during_the_check_cancels_the_trim(db, change):
+    for name, load in (("a", 0), ("b", 1), ("c", 2), ("d", 3)):
+        add_node(db, name, chunk_count=load)
+    add_chunk(db, holders=("a", "b", "c", "d"))
+    calls = []
+
+    def on_get(host):
+        # Another request changes a keeper while its bytes are being read.
+        if host == "b":
+            change(db, host)
+
+    with trim_peer(calls, on_get=on_get) as client:
+        assert replicator.trim_over_replicated(db, client, 3, 10) == 0
+    assert all(method == "GET" for method, _ in calls)
+    assert db.query(Replica).filter(Replica.node_id == "d").count() == 1
+
+
+@pytest.mark.parametrize("failure", ["error", "unreachable"])
+def test_trim_forgets_the_copy_before_deleting_bytes_and_tolerates_a_failed_delete(db, failure):
+    for name, load in (("a", 0), ("b", 1), ("c", 2), ("d", 3)):
+        add_node(db, name, chunk_count=load)
+    add_chunk(db, holders=("a", "b", "c", "d"))
+    seen = []
+
+    def on_delete(request):
+        # By the time the bytes are deleted, no committed row may still point at them.
+        seen.append(db.query(Replica).filter(Replica.node_id == "d").count())
+        if failure == "unreachable":
+            raise httpx.ConnectError("node went away", request=request)
+        return response_for(request, 507)
+
+    start = replicator.events_after(0)["latest"]
+    with trim_peer([], on_delete=on_delete) as client:
+        assert replicator.trim_over_replicated(db, client, 3, 10) == 1
+    assert seen == [0]
+    assert {row.node_id for row in db.query(Replica)} == {"a", "b", "c"}
+    assert len(replicator.events_after(start)["events"]) == 1
