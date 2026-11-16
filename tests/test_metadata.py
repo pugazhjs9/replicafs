@@ -354,6 +354,7 @@ def test_concurrent_same_filename_uploads_get_unique_consecutive_versions(api):
     [
         ("/files/absent", "get"),
         ("/files/absent/versions", "get"),
+        ("/files/absent/chunks", "get"),
         ("/files/absent", "delete"),
         ("/files/absent/restore", "post"),
     ],
@@ -709,6 +710,56 @@ def test_cluster_reports_chunks_with_zero_live_copies(api):
     assert status["nodes_dead"] == 3
 
 
+def test_chunk_map_lists_each_copy_with_its_node_state(api):
+    api.nodes()
+    data = b"abcdefghij"
+    assert api.upload(data).status_code == 201
+    with api.sessions() as db:
+        db.get(Node, "node2").status = "DEAD"
+        db.commit()
+    response = api.client.get("/files/sample.bin/chunks")
+    assert response.status_code == 200
+    info = response.json()
+    assert (info["name"], info["version"], info["size"]) == ("sample.bin", 1, 10)
+    assert info["replication_factor"] == 3
+    assert [c["index"] for c in info["placement"]] == [0, 1, 2]
+    assert [c["size"] for c in info["placement"]] == [4, 4, 2]
+    assert [c["checksum"] for c in info["placement"]] == [
+        sha256_hex(data[i : i + 4]) for i in range(0, len(data), 4)
+    ]
+    for chunk in info["placement"]:
+        assert chunk["replicas"] == [
+            {"node_id": "node1", "status": "ALIVE"},
+            {"node_id": "node2", "status": "DEAD"},
+            {"node_id": "node3", "status": "ALIVE"},
+        ]
+
+
+def test_chunk_map_follows_versions_and_soft_delete(api):
+    api.nodes()
+    api.upload(b"one")
+    api.upload(b"second")
+    assert api.client.get("/files/sample.bin/chunks").json()["version"] == 2
+    old = api.client.get("/files/sample.bin/chunks?version=1").json()
+    assert (old["version"], old["size"], len(old["placement"])) == (1, 3, 1)
+    assert api.client.get("/files/sample.bin/chunks?version=0").status_code == 422
+    api.client.delete("/files/sample.bin")
+    assert api.client.get("/files/sample.bin/chunks").status_code == 404
+    assert api.client.get("/files/sample.bin/chunks?version=1").status_code == 404
+
+
+def test_dashboard_page_is_public_and_root_redirects_to_it(api, monkeypatch):
+    monkeypatch.setenv("API_TOKEN", "client-secret")
+    page = api.client.get("/ui")
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "ReplicaFS" in page.text and "/chunks" in page.text
+    root = api.client.get("/", follow_redirects=False)
+    assert root.status_code == 307
+    assert root.headers["location"] == "/ui"
+    assert api.client.get("/files").status_code == 401
+
+
 def test_metrics_exposes_prometheus_text(api):
     response = api.client.get("/metrics")
     assert response.status_code == 200
@@ -723,6 +774,7 @@ def test_metrics_exposes_prometheus_text(api):
         ("/files", "post", {"files": {"file": ("x", b"x")}}),
         ("/files/absent", "get", {}),
         ("/files/absent/versions", "get", {}),
+        ("/files/absent/chunks", "get", {}),
         ("/files/absent", "delete", {}),
         ("/files/absent/restore", "post", {}),
         ("/nodes", "get", {}),

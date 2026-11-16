@@ -18,11 +18,13 @@ Authorization: Bearer your-token-value
 |---|---|---|---|
 | GET | `/health` | Public | Process/database liveness check. |
 | GET | `/ready` | Public | Whether enough healthy nodes exist for the configured minimum write policy. |
+| GET | `/ui` | Public page | Live dashboard (`/` redirects here). Its data requests use the API token. |
 | POST | `/files` | API | Multipart upload using field `file`; returns 201 after commit. |
 | GET | `/files` | API | Latest visible version of each file name. |
 | GET | `/files/{name}` | API | Download latest visible version. |
 | GET | `/files/{name}?version=1` | API | Download a specific visible positive version. |
 | GET | `/files/{name}/versions` | API | List retained versions, including deleted versions. |
+| GET | `/files/{name}/chunks` | API | Chunk map of the latest (or `?version=N`) visible version: each chunk's size, checksum and holders with their node state. |
 | DELETE | `/files/{name}` | API | Soft-delete all currently visible versions of that name. |
 | POST | `/files/{name}/restore` | API | Restore all deleted versions of that name. |
 | GET | `/nodes` | API | Node addresses, heartbeat times, capacity/load, and state. |

@@ -6,13 +6,14 @@ import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -51,6 +52,7 @@ client = httpx.Client(trust_env=False)
 # A single uvicorn worker is required; the DB unique constraint is the last guard.
 file_mutation_lock = threading.RLock()
 API = [Depends(require_api_token)]
+UI_PAGE = Path(__file__).with_name("ui.html")
 
 
 def get_db():
@@ -96,6 +98,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ReplicaFS metadata server", version="1.0.0", lifespan=lifespan)
 app.add_middleware(UploadBodyLimit, limit=lambda: MAX_FILE_BYTES + 64 * 1024)
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/ui")
+
+
+@app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
+def dashboard():
+    # Static page; its data requests carry the API token like any other client.
+    return HTMLResponse(UI_PAGE.read_text(encoding="utf-8"))
 
 
 @app.get("/health")
@@ -230,6 +243,14 @@ def latest_file(db: Session, name: str, include_deleted: bool = False) -> File |
     return query.order_by(File.version.desc()).first()
 
 
+def visible_file(db: Session, name: str, version: int | None) -> File | None:
+    if version is None:
+        return latest_file(db, name)
+    return (
+        db.query(File).filter(File.name == name, File.version == version, File.deleted_at.is_(None)).first()
+    )
+
+
 def file_summary(record: File) -> dict:
     return {
         "name": record.name,
@@ -355,17 +376,39 @@ def versions(name: str, db: Session = Depends(get_db)):
     return [file_summary(record) for record in rows]
 
 
+@app.get("/files/{name}/chunks", dependencies=API)
+def chunk_map(name: str, version: Annotated[int | None, Query(ge=1)] = None, db: Session = Depends(get_db)):
+    """Where each chunk of a visible version is stored, with each holder's current state."""
+    checked_name(name)
+    expire_nodes(db)
+    record = visible_file(db, name, version)
+    if record is None:
+        raise HTTPException(status_code=404, detail="file not found")
+    status = {node.id: node.status for node in db.query(Node)}
+    return {
+        **file_summary(record),
+        "replication_factor": REPLICATION_FACTOR,
+        "placement": [
+            {
+                "index": chunk.index,
+                "chunk_id": chunk.id,
+                "size": chunk.size,
+                "checksum": chunk.checksum,
+                "replicas": [
+                    {"node_id": node_id, "status": status[node_id]}
+                    for node_id in sorted(r.node_id for r in chunk.replicas)
+                ],
+            }
+            for chunk in record.chunks
+        ],
+    }
+
+
 @app.get("/files/{name}", dependencies=API)
 def download(name: str, version: Annotated[int | None, Query(ge=1)] = None, db: Session = Depends(get_db)):
     checked_name(name)
     expire_nodes(db)
-    record = (
-        latest_file(db, name)
-        if version is None
-        else db.query(File)
-        .filter(File.name == name, File.version == version, File.deleted_at.is_(None))
-        .first()
-    )
+    record = visible_file(db, name, version)
     if record is None:
         raise HTTPException(status_code=404, detail="file not found")
     alive = {node.id: node.url for node in alive_nodes(db)}

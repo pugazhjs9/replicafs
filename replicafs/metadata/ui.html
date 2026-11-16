@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReplicaFS Dashboard</title>
+<style>
+  :root {
+    --bg: #f4f6f9; --card: #ffffff; --ink: #18202c; --muted: #5d6778; --line: #dfe3ea;
+    --accent: #0f6e8c; --ok: #1f8a4c; --ok-soft: #e3f4ea; --bad: #c0392b; --bad-soft: #fbe9e7;
+    --warn: #b9770e; --warn-soft: #fdf2dc; --empty: #eef1f5;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 24px; background: #0f2f3d; color: #fff; }
+  header h1 { margin: 0; font-size: 22px; letter-spacing: -0.3px; }
+  header .sub { color: #a9d4e2; font-size: 14px; }
+  header .spacer { flex: 1; }
+  .conn { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #d5e9f0; }
+  .conn i { width: 10px; height: 10px; border-radius: 50%; background: #7a8796; display: inline-block; }
+  .conn.live i { background: #3ddc84; box-shadow: 0 0 0 3px rgba(61,220,132,.25); }
+  .conn.down i { background: #ff6b5b; }
+  header button { background: transparent; color: #d5e9f0; border: 1px solid #4b7486; border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit; font-size: 13px; }
+  main { padding: 18px 24px 40px; max-width: 1500px; margin: 0 auto; }
+  .stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 16px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+  .stat b { display: block; font-size: 26px; line-height: 1.15; }
+  .stat span { color: var(--muted); font-size: 13px; }
+  .stat.ok b { color: var(--ok); } .stat.bad b { color: var(--bad); } .stat.warn b { color: var(--warn); }
+  .nodes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .node { background: var(--card); border: 2px solid var(--line); border-radius: 12px; padding: 12px 14px; transition: border-color .3s, background .3s; }
+  .node.ALIVE { border-color: #9fd8b5; }
+  .node.DEAD { border-color: var(--bad); background: var(--bad-soft); }
+  .node.RECOVERING { border-color: #e8b04b; background: var(--warn-soft); }
+  .node .top { display: flex; justify-content: space-between; align-items: center; }
+  .node .nid { font-weight: 700; font-size: 18px; }
+  .pill { font-size: 12px; font-weight: 700; letter-spacing: .4px; padding: 3px 9px; border-radius: 20px; color: #fff; background: var(--muted); }
+  .ALIVE .pill { background: var(--ok); } .DEAD .pill { background: var(--bad); } .RECOVERING .pill { background: var(--warn); }
+  .hb { margin-top: 8px; font-size: 13.5px; color: var(--muted); display: flex; align-items: center; gap: 7px; }
+  .hb .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); }
+  .DEAD .hb .dot { background: var(--bad); } .RECOVERING .hb .dot { background: var(--warn); }
+  .hb .dot.beat { animation: beat .6s ease-out; }
+  @keyframes beat { 0% { box-shadow: 0 0 0 0 rgba(31,138,76,.6); transform: scale(1.4); } 100% { box-shadow: 0 0 0 10px rgba(31,138,76,0); transform: scale(1); } }
+  .bar { height: 7px; background: var(--empty); border-radius: 4px; margin-top: 7px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--ok); border-radius: 4px; }
+  .bar i.mid { background: var(--warn); } .bar i.high { background: var(--bad); }
+  .node .meta { margin-top: 7px; font-size: 12.5px; color: var(--muted); }
+  .node .why { margin-top: 6px; font-size: 12.5px; font-weight: 600; }
+  .DEAD .why { color: var(--bad); } .RECOVERING .why { color: var(--warn); } .ALIVE .why { color: var(--ok); }
+  .grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(0, 1fr); gap: 16px; }
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 10px; font-size: 16px; display: flex; align-items: center; gap: 10px; }
+  .panel h2 .hint { font-weight: 400; color: var(--muted); font-size: 13px; }
+  .maphead { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: baseline; margin-bottom: 8px; font-size: 13.5px; color: var(--muted); }
+  .maphead b { color: var(--ink); font-size: 15px; }
+  .versions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .chip { border: 1px solid var(--line); background: #fff; border-radius: 16px; padding: 3px 10px; font-size: 13px; cursor: pointer; font: inherit; font-size: 13px; }
+  .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .chip.gone { text-decoration: line-through; color: var(--muted); cursor: default; }
+  .mapwrap { max-height: 380px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { padding: 6px 9px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+  th { background: #f6f8fb; font-weight: 600; position: sticky; top: 0; z-index: 1; }
+  td.cell { text-align: center; }
+  .sq { display: inline-block; width: 26px; height: 20px; border-radius: 4px; background: var(--empty); vertical-align: middle; }
+  .sq.ALIVE { background: var(--ok); }
+  .sq.DEAD { background: repeating-linear-gradient(45deg, #e6a29a, #e6a29a 4px, #f7d9d5 4px, #f7d9d5 8px); outline: 1.5px solid var(--bad); }
+  .sq.RECOVERING { background: #f0c46a; }
+  .sq.new { animation: flash 1s ease-in-out 3; }
+  @keyframes flash { 0%,100% { box-shadow: 0 0 0 0 rgba(15,110,140,0); } 50% { box-shadow: 0 0 0 5px rgba(15,110,140,.55); } }
+  .badge { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
+  .badge.ok { background: var(--ok-soft); color: var(--ok); } .badge.warn { background: var(--warn-soft); color: var(--warn); } .badge.bad { background: var(--bad-soft); color: var(--bad); }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+  .legend span { display: flex; align-items: center; gap: 6px; }
+  .legend .sq { width: 16px; height: 13px; }
+  .empty { color: var(--muted); padding: 22px 6px; text-align: center; }
+  .log { list-style: none; margin: 0; padding: 0; max-height: 470px; overflow: auto; font-size: 13.5px; }
+  .log li { padding: 7px 4px 7px 12px; border-left: 4px solid var(--line); margin-bottom: 6px; background: #fafbfc; border-radius: 0 6px 6px 0; }
+  .log li.ok { border-left-color: var(--ok); } .log li.bad { border-left-color: var(--bad); } .log li.warn { border-left-color: var(--warn); } .log li.info { border-left-color: var(--accent); }
+  .log time { color: var(--muted); font-size: 12px; margin-right: 6px; font-variant-numeric: tabular-nums; }
+  .log .why { display: block; color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .upload { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .drop { flex: 1; min-width: 240px; border: 2px dashed #b7c3d1; border-radius: 10px; padding: 14px; text-align: center; color: var(--muted); cursor: pointer; }
+  .drop.over { border-color: var(--accent); background: #eaf5f9; color: var(--accent); }
+  button.act { font: inherit; font-size: 13px; border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; margin-right: 4px; }
+  button.act:hover { border-color: var(--accent); color: var(--accent); }
+  button.act.danger:hover { border-color: var(--bad); color: var(--bad); }
+  button.primary { font: inherit; font-weight: 600; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 16px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  tr.sel td { background: #eaf5f9; }
+  .deleted { margin-top: 10px; font-size: 13.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .cmd { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .cmd code { flex: 1; background: #0f2f3d; color: #e5f3f8; padding: 8px 10px; border-radius: 6px; font: 13.5px Menlo, Consolas, monospace; }
+  ol.steps { margin: 8px 0 0; padding-left: 20px; font-size: 13.5px; color: var(--muted); }
+  ol.steps li { margin-bottom: 3px; }
+  .status { font-size: 13.5px; color: var(--muted); }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 760px) { .nodes { grid-template-columns: repeat(2, 1fr); } main { padding: 12px; } }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>ReplicaFS</h1><div class="sub">Live cluster dashboard: chunks, copies, heartbeats and self-healing</div></div>
+  <div class="spacer"></div>
+  <div class="conn" id="conn"><i></i><span>connecting…</span></div>
+  <button id="tokenBtn" title="Only needed when API_TOKEN is set">API token</button>
+</header>
+<main>
+  <section class="stats" id="stats"></section>
+  <section class="nodes" id="nodes"></section>
+  <div class="grid">
+    <div>
+      <section class="panel">
+        <h2>Chunk map <span class="hint">rows = chunks of the file, columns = storage nodes, a filled box = one stored copy</span></h2>
+        <div id="maphead" class="maphead"></div>
+        <div id="versions" class="versions"></div>
+        <div class="mapwrap" id="map"></div>
+        <div class="legend">
+          <span><i class="sq ALIVE"></i> copy on a live node</span>
+          <span><i class="sq DEAD"></i> copy on a DEAD node (not trusted)</span>
+          <span><i class="sq RECOVERING"></i> being re-verified</span>
+          <span><i class="sq"></i> no copy</span>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Files <span class="hint">upload, download (SHA-256 checked in the browser), versions, delete and restore</span></h2>
+        <div class="upload">
+          <label class="drop" id="drop">Drop a file here or click to choose<input type="file" id="fileInput" hidden></label>
+          <span class="status" id="uploadStatus"></span>
+        </div>
+        <div id="files"></div>
+        <div class="deleted" id="deleted"></div>
+      </section>
+    </div>
+    <div>
+      <section class="panel">
+        <h2>Activity <span class="hint">what the cluster is doing, newest first</span></h2>
+        <ul class="log" id="log"></ul>
+      </section>
+      <section class="panel">
+        <h2>Simulate a server crash</h2>
+        <div class="cmd"><code>docker compose stop node2</code><button class="act" data-copy="docker compose stop node2">Copy</button></div>
+        <div class="cmd"><code>docker compose start node2</code><button class="act" data-copy="docker compose start node2">Copy</button></div>
+        <ol class="steps">
+          <li>Upload a file and look at its chunk map: every row has 3 green boxes.</li>
+          <li>Run the stop command in a terminal (inside ~/Projects/replicafs).</li>
+          <li>node2's heartbeat timer fills up; after 10 s it turns DEAD.</li>
+          <li>Watch new copies flash in on other nodes; every row returns to 3 live copies.</li>
+          <li>Click Download: the SHA-256 still matches, with node2 down.</li>
+          <li>Run the start command: node2 goes RECOVERING, then ALIVE.</li>
+        </ol>
+      </section>
+    </div>
+  </div>
+</main>
+<script>
+(() => {
+  const DEAD_AFTER = 10; // seconds; matches the default DEAD_AFTER_SECONDS
+  const $ = (sel) => document.querySelector(sel);
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const enc = encodeURIComponent;
+  const store = {
+    get(key, fallback) { try { const v = sessionStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; } },
+    set(key, value) { try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* storage unavailable */ } },
+  };
+  const state = {
+    token: store.get("rfs-token", ""), nodes: [], cluster: null, files: [], map: null, versions: [],
+    selected: store.get("rfs-selected", null), deleted: store.get("rfs-deleted", []),
+    prevStatus: {}, prevBeat: {}, prevUnder: null, prevCells: null, prevMapKey: null, flash: new Map(), started: false,
+  };
+
+  function fmtBytes(n) {
+    if (n < 1024) return n + " B";
+    const units = ["KB", "MB", "GB", "TB"]; let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+    return n.toFixed(n < 10 ? 1 : 0) + " " + units[i];
+  }
+  const ageSeconds = (iso) => Math.max(0, (Date.now() - Date.parse(iso + "Z")) / 1000);
+  const clock = () => new Date().toLocaleTimeString([], { hour12: false });
+
+  async function api(path, opts = {}) {
+    const headers = { ...(opts.headers || {}) };
+    if (state.token) headers.Authorization = "Bearer " + state.token;
+    const response = await fetch(path, { ...opts, headers });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try { const body = await response.json(); detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail); } catch { /* not JSON */ }
+      const error = new Error(detail); error.status = response.status; throw error;
+    }
+    return response;
+  }
+  const getJSON = (path) => api(path).then((r) => r.json());
+
+  function log(kind, text, why) {
+    const li = document.createElement("li");
+    li.className = kind;
+    li.innerHTML = `<time>${clock()}</time>${esc(text)}${why ? `<span class="why">${esc(why)}</span>` : ""}`;
+    const list = $("#log"); list.prepend(li);
+    while (list.children.length > 80) list.lastChild.remove();
+  }
+
+  const TRANSITIONS = {
+    "ALIVE>DEAD": ["bad", `no heartbeat for ${DEAD_AFTER} s, so it is marked DEAD. Its copies no longer count; repair starts.`],
+    "RECOVERING>DEAD": ["bad", "went silent again while being verified."],
+    "DEAD>RECOVERING": ["warn", "heartbeats are back. Every chunk it claims is re-checked by SHA-256 before it is trusted."],
+    "ALIVE>RECOVERING": ["warn", "it restarted, so its disk is re-checked before it is trusted again."],
+    "RECOVERING>ALIVE": ["ok", "all of its chunks were verified. It is trusted again."],
+    "DEAD>ALIVE": ["ok", "back and trusted."],
+  };
+
+  function diffNodes(nodes) {
+    for (const n of nodes) {
+      const before = state.prevStatus[n.id];
+      if (before === undefined && state.started) log("info", `${n.id} joined the cluster (${n.status})`);
+      if (before !== undefined && before !== n.status) {
+        const [kind, why] = TRANSITIONS[`${before}>${n.status}`] || ["info", ""];
+        log(kind, `${n.id}: ${before} → ${n.status}`, why);
+      }
+      state.prevStatus[n.id] = n.status;
+    }
+  }
+
+  function diffCluster(c) {
+    const under = c.under_replicated_chunks;
+    if (state.prevUnder !== null && under !== state.prevUnder) {
+      if (under > state.prevUnder) log("warn", `${under} chunk(s) now have fewer than ${c.replication_factor} live copies`, "The monitor copies them from surviving nodes every few seconds.");
+      else if (under === 0) log("ok", `Self-healing finished: every chunk is back to ${c.replication_factor} live copies`);
+    }
+    if (c.unavailable_chunks > 0 && (state.cluster === null || state.cluster.unavailable_chunks === 0)) {
+      log("bad", `${c.unavailable_chunks} chunk(s) have no live copy`, "Downloads that need them return 503 until a holder returns.");
+    }
+    state.prevUnder = under;
+  }
+
+  function diffMap(map) {
+    const key = `${map.name}@${map.version}`;
+    const cells = new Map();
+    for (const chunk of map.placement) for (const r of chunk.replicas) cells.set(`${chunk.chunk_id}|${r.node_id}`, chunk.index);
+    if (state.prevMapKey === key && state.prevCells) {
+      const added = {}, removed = {};
+      for (const [cell, index] of cells) if (!state.prevCells.has(cell)) {
+        const node = cell.split("|")[1]; (added[node] ||= []).push(index); state.flash.set(cell, Date.now() + 3500);
+      }
+      for (const [cell, index] of state.prevCells) if (!cells.has(cell)) { const node = cell.split("|")[1]; (removed[node] ||= []).push(index); }
+      for (const [node, list] of Object.entries(added)) log("ok", `Repair: copied chunk ${list.sort((a, b) => a - b).join(", ")} of ${map.name} to ${node}`, "The target node pulled a copy from a survivor and checked its SHA-256.");
+      for (const [node, list] of Object.entries(removed)) log("warn", `Dropped the copy of chunk ${list.sort((a, b) => a - b).join(", ")} on ${node}`, "That copy was missing or failed its checksum, so it is no longer trusted.");
+    }
+    state.prevMapKey = key; state.prevCells = cells;
+  }
+
+  function select(name, version = null) {
+    state.selected = { name, version }; store.set("rfs-selected", state.selected);
+    state.prevMapKey = null; state.prevCells = null; state.map = null; state.versions = [];
+    render(); refresh();
+  }
+
+  let timer = null, busy = false;
+  async function refresh() {
+    clearTimeout(timer);
+    if (busy) { timer = setTimeout(refresh, 300); return; }
+    busy = true;
+    try {
+      const [nodes, cluster, files] = await Promise.all([getJSON("/nodes"), getJSON("/cluster"), getJSON("/files")]);
+      if (!state.started) log("info", `Connected: ${nodes.length} storage nodes, ${files.length} file(s)`);
+      diffNodes(nodes);
+      state.nodes = nodes; state.files = files;
+      if (!state.selected && files.length) {
+        const newest = [...files].sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+        state.selected = { name: newest.name, version: null };
+      }
+      if (state.selected) {
+        const { name, version } = state.selected;
+        try {
+          state.versions = await getJSON(`/files/${enc(name)}/versions`);
+          const map = await getJSON(`/files/${enc(name)}/chunks${version ? `?version=${version}` : ""}`);
+          diffMap(map); state.map = map;
+        } catch (error) {
+          if (error.status !== 404) throw error;
+          state.map = null;
+        }
+      }
+      // After the map diff, so individual repairs are logged before the summary.
+      diffCluster(cluster); state.cluster = cluster;
+      state.started = true;
+      setConn(true);
+      render();
+    } catch (error) {
+      setConn(false, error.status === 401 ? "token required" : error.message);
+      if (error.status === 401 && !state.asked) { state.asked = true; askToken(); }
+    } finally {
+      busy = false;
+      timer = setTimeout(refresh, 1000);
+    }
+  }
+
+  function setConn(ok, why) {
+    const el = $("#conn");
+    el.className = "conn " + (ok ? "live" : "down");
+    el.querySelector("span").textContent = ok ? "live · refreshes every second" : "disconnected: " + (why || "metadata server unreachable");
+  }
+
+  function render() { renderStats(); renderNodes(); renderMap(); renderFiles(); }
+
+  function renderStats() {
+    const c = state.cluster; if (!c) return;
+    const total = c.nodes_alive + c.nodes_dead + c.nodes_recovering;
+    const tiles = [
+      ["Nodes alive", `${c.nodes_alive}/${total}`, c.nodes_alive === total ? "ok" : "bad"],
+      ["Replication factor", c.replication_factor, ""],
+      ["Chunks fully replicated", `${c.healthy_chunks}/${c.chunks}`, c.healthy_chunks === c.chunks ? "ok" : "warn"],
+      ["Under-replicated chunks", c.under_replicated_chunks, c.under_replicated_chunks ? "warn" : "ok"],
+      ["Unavailable chunks", c.unavailable_chunks, c.unavailable_chunks ? "bad" : "ok"],
+      ["Live copies stored", c.live_replicas, ""],
+    ];
+    $("#stats").innerHTML = tiles.map(([label, value, kind]) => `<div class="stat ${kind}"><b>${esc(value)}</b><span>${esc(label)}</span></div>`).join("");
+  }
+
+  function renderNodes() {
+    $("#nodes").innerHTML = state.nodes.map((n) => {
+      const why = n.status === "DEAD" ? "No heartbeat: copies not trusted" : n.status === "RECOVERING" ? "Back: verifying its chunks…" : "Healthy";
+      return `<div class="node ${esc(n.status)}" data-id="${esc(n.id)}">
+        <div class="top"><span class="nid">${esc(n.id)}</span><span class="pill">${esc(n.status)}</span></div>
+        <div class="hb"><span class="dot"></span><span>last heartbeat <b class="age">–</b> ago</span></div>
+        <div class="bar"><i></i></div>
+        <div class="meta">${esc(n.chunk_count)} chunks · ${n.free_bytes >= 0 ? esc(fmtBytes(n.free_bytes)) + " free" : "free space unknown"}</div>
+        <div class="why">${why}</div>
+      </div>`;
+    }).join("");
+    for (const n of state.nodes) {
+      if (state.prevBeat[n.id] !== undefined && state.prevBeat[n.id] !== n.last_heartbeat) {
+        const dot = document.querySelector(`.node[data-id="${CSS.escape(n.id)}"] .dot`);
+        if (dot) dot.classList.add("beat");
+      }
+      state.prevBeat[n.id] = n.last_heartbeat;
+    }
+    updateAges();
+  }
+
+  function updateAges() {
+    for (const n of state.nodes) {
+      const card = document.querySelector(`.node[data-id="${CSS.escape(n.id)}"]`); if (!card) continue;
+      const age = ageSeconds(n.last_heartbeat);
+      card.querySelector(".age").textContent = age.toFixed(1) + " s";
+      const bar = card.querySelector(".bar i");
+      const pct = Math.min(100, (age / DEAD_AFTER) * 100);
+      bar.style.width = pct + "%";
+      bar.className = pct >= 100 ? "high" : pct > 45 ? "mid" : "";
+    }
+  }
+
+  function renderMap() {
+    const head = $("#maphead"), map = $("#map"), versions = $("#versions");
+    const sel = state.selected;
+    if (!sel) { head.innerHTML = ""; versions.innerHTML = ""; map.innerHTML = `<div class="empty">Upload a file to see where its chunks are stored.</div>`; return; }
+    versions.innerHTML = state.versions.length > 1 || state.versions.some((v) => v.deleted_at)
+      ? `<span class="status">Versions:</span>` + state.versions.map((v) => {
+          const on = state.map && state.map.version === v.version;
+          return v.deleted_at
+            ? `<span class="chip gone" title="soft-deleted">v${v.version}</span>`
+            : `<button class="chip ${on ? "on" : ""}" data-version="${v.version}">v${v.version}</button>`;
+        }).join("")
+      : "";
+    const m = state.map;
+    if (!m) {
+      head.innerHTML = `<b>${esc(sel.name)}</b>`;
+      map.innerHTML = `<div class="empty">This file is soft-deleted, so it is hidden. Restore it from the Files panel.</div>`;
+      return;
+    }
+    const live = (chunk) => chunk.replicas.filter((r) => r.status === "ALIVE").length;
+    const minLive = m.placement.length ? Math.min(...m.placement.map(live)) : 0;
+    head.innerHTML = `<b>${esc(m.name)}</b><span>version ${m.version}</span><span>${esc(fmtBytes(m.size))}</span><span>${m.placement.length} chunk(s)</span><span title="${esc(m.checksum)}">SHA-256 ${esc(m.checksum.slice(0, 12))}…</span>
+      <button class="act" data-dl="${esc(m.name)}" data-v="${m.version}">Download v${m.version}</button>`;
+    if (!m.placement.length) { map.innerHTML = `<div class="empty">Empty file: no chunks to store.</div>`; return; }
+    const nodeIds = [...new Set([...state.nodes.map((n) => n.id), ...m.placement.flatMap((c) => c.replicas.map((r) => r.node_id))])].sort();
+    const now = Date.now();
+    const rows = m.placement.map((chunk) => {
+      const byNode = Object.fromEntries(chunk.replicas.map((r) => [r.node_id, r.status]));
+      const count = live(chunk);
+      const kind = count >= m.replication_factor ? "ok" : count === 0 ? "bad" : "warn";
+      const cells = nodeIds.map((id) => {
+        const status = byNode[id];
+        const isNew = (state.flash.get(`${chunk.chunk_id}|${id}`) || 0) > now;
+        return `<td class="cell"><i class="sq ${status ? esc(status) : ""} ${isNew ? "new" : ""}" title="${status ? esc(id + ": " + status) : "no copy"}"></i></td>`;
+      }).join("");
+      const label = count > m.replication_factor ? `${count} live (target ${m.replication_factor})` : `${count} of ${m.replication_factor} live`;
+      return `<tr><td>chunk ${chunk.index}</td><td>${esc(fmtBytes(chunk.size))}</td>${cells}<td><span class="badge ${kind}">${label}</span></td></tr>`;
+    }).join("");
+    map.innerHTML = `<table><thead><tr><th>Chunk</th><th>Size</th>${nodeIds.map((id) => `<th style="text-align:center">${esc(id)}</th>`).join("")}<th>Copies</th></tr></thead><tbody>${rows}</tbody></table>`;
+    head.insertAdjacentHTML("beforeend", `<span class="badge ${minLive >= m.replication_factor ? "ok" : minLive === 0 ? "bad" : "warn"}">${minLive >= m.replication_factor ? "fully replicated" : minLive === 0 ? "some chunks unavailable" : "repairing…"}</span>`);
+  }
+
+  function renderFiles() {
+    const files = [...state.files].sort((a, b) => b.created_at.localeCompare(a.created_at));
+    $("#files").innerHTML = files.length ? `<table><thead><tr><th>Name</th><th>Latest</th><th>Size</th><th>Chunks</th><th></th></tr></thead><tbody>${
+      files.map((f) => `<tr class="${state.selected && state.selected.name === f.name ? "sel" : ""}">
+        <td>${esc(f.name)}</td><td>v${f.version}</td><td>${esc(fmtBytes(f.size))}</td><td>${f.chunks}</td>
+        <td><button class="act" data-show="${esc(f.name)}">Show map</button><button class="act" data-dl="${esc(f.name)}">Download</button><button class="act danger" data-del="${esc(f.name)}">Delete</button></td></tr>`).join("")
+    }</tbody></table>` : `<div class="empty">No files yet.</div>`;
+    const deleted = state.deleted.filter((name) => !state.files.some((f) => f.name === name));
+    $("#deleted").innerHTML = deleted.length ? `<span>Deleted (restorable):</span>` + deleted.map((name) => `<button class="act" data-restore="${esc(name)}">↺ Restore ${esc(name)}</button>`).join("") : "";
+  }
+
+  async function upload(file) {
+    const status = $("#uploadStatus");
+    status.textContent = `Uploading ${file.name} (${fmtBytes(file.size)})…`;
+    try {
+      const body = new FormData(); body.append("file", file, file.name);
+      const info = await (await api("/files", { method: "POST", body })).json();
+      status.textContent = "";
+      log("ok", `Uploaded ${info.name} as version ${info.version}: ${info.chunks} chunk(s), ${info.min_replicas} copies each${info.degraded ? " (DEGRADED)" : ""}`,
+        `Split into ${info.chunks} piece(s); each piece was written to ${info.min_replicas} different nodes and checked by SHA-256 there.`);
+      state.deleted = state.deleted.filter((n) => n !== info.name); store.set("rfs-deleted", state.deleted);
+      select(info.name);
+    } catch (error) {
+      status.textContent = "";
+      log("bad", `Upload of ${file.name} failed: ${error.message}`);
+    }
+  }
+
+  async function download(name, version) {
+    try {
+      const response = await api(`/files/${enc(name)}${version ? `?version=${version}` : ""}`);
+      const expected = response.headers.get("X-Checksum");
+      const buffer = await response.arrayBuffer();
+      let verdict = "";
+      if (window.crypto && crypto.subtle) {
+        const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", buffer))].map((b) => b.toString(16).padStart(2, "0")).join("");
+        verdict = digest === expected ? "SHA-256 matches the stored checksum ✓" : "SHA-256 MISMATCH ✗";
+      }
+      const down = state.nodes.filter((n) => n.status !== "ALIVE").map((n) => n.id);
+      log(verdict.includes("✗") ? "bad" : "ok", `Downloaded ${name}${version ? ` v${version}` : ""} (${fmtBytes(buffer.byteLength)}): ${verdict || "done"}`,
+        down.length ? `Served from the surviving copies while ${down.join(", ")} ${down.length > 1 ? "are" : "is"} not ALIVE.` : "Every chunk was verified before the response was sent.");
+      const url = URL.createObjectURL(new Blob([buffer]));
+      const a = document.createElement("a"); a.href = url; a.download = name; document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (error) {
+      log("bad", `Download of ${name} failed: ${error.message}`);
+    }
+  }
+
+  async function remove(name) {
+    try {
+      const info = await (await api(`/files/${enc(name)}`, { method: "DELETE" })).json();
+      if (!state.deleted.includes(name)) state.deleted.push(name);
+      store.set("rfs-deleted", state.deleted);
+      log("warn", `Deleted ${name} (version ${info.versions.join(", ")})`, "Soft delete: the file is hidden, but its chunks stay on disk, so it can be restored.");
+      refresh();
+    } catch (error) { log("bad", `Delete failed: ${error.message}`); }
+  }
+
+  async function restore(name) {
+    try {
+      const info = await (await api(`/files/${enc(name)}/restore`, { method: "POST" })).json();
+      log("ok", `Restored ${name} (version ${info.versions.join(", ")})`, "Only the deleted mark was cleared. No data had to be copied.");
+    } catch (error) { log(error.status === 404 ? "info" : "bad", `Restore ${name}: ${error.message}`); }
+    state.deleted = state.deleted.filter((n) => n !== name); store.set("rfs-deleted", state.deleted);
+    select(name);
+  }
+
+  function askToken() {
+    const value = window.prompt("API token (leave empty when API_TOKEN is not set):", state.token);
+    if (value === null) return;
+    state.token = value.trim(); store.set("rfs-token", state.token); state.asked = false; refresh();
+  }
+
+  document.addEventListener("click", (event) => {
+    const t = event.target.closest("button"); if (!t) return;
+    if (t.dataset.show) select(t.dataset.show);
+    else if (t.dataset.version) select(state.selected.name, Number(t.dataset.version));
+    else if (t.dataset.dl) download(t.dataset.dl, t.dataset.v ? Number(t.dataset.v) : null);
+    else if (t.dataset.del) remove(t.dataset.del);
+    else if (t.dataset.restore) restore(t.dataset.restore);
+    else if (t.dataset.copy) {
+      const done = () => { t.textContent = "Copied"; setTimeout(() => (t.textContent = "Copy"), 1200); };
+      if (navigator.clipboard) navigator.clipboard.writeText(t.dataset.copy).then(done, () => {}); else done();
+    } else if (t.id === "tokenBtn") askToken();
+  });
+  const drop = $("#drop"), input = $("#fileInput");
+  input.addEventListener("change", () => { if (input.files[0]) upload(input.files[0]); input.value = ""; });
+  ["dragenter", "dragover"].forEach((type) => drop.addEventListener(type, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach((type) => drop.addEventListener(type, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", (e) => { if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); });
+
+  setInterval(() => {
+    updateAges();
+    const now = Date.now();
+    for (const [cell, until] of state.flash) if (until <= now) state.flash.delete(cell);
+  }, 200);
+  refresh();
+})();
+</script>
+</body>
+</html>

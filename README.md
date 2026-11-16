@@ -65,6 +65,10 @@ python scripts/dev_cluster.py
 
 Keep that terminal open. Run the same `curl` commands in a second terminal. Ctrl+C stops the child servers; `data/dev` keeps their database, chunks, and logs. Use `--base-port 9000 --data-dir data/dev9000` for a separate dataset if ports 8000–8004 are occupied. [The hands-on guide](docs/05-try-it-yourself.md) explains each step.
 
+## Watch it in the browser
+
+Open **http://127.0.0.1:8000/ui** for a live dashboard. It refreshes every second and shows node heartbeats and states, a chunk map (which node holds each copy of each chunk), and an activity log. You can upload, download (the browser re-checks the SHA-256), browse versions, delete and restore files there. Stop a node with `docker compose stop node2` and watch it turn DEAD after the timeout, then watch new copies appear on the other nodes. Run `docker compose start node2` to see it go through RECOVERING back to ALIVE.
+
 ## Demonstrate failure recovery
 
 With the Docker cluster running:
