@@ -71,9 +71,9 @@ These are internal endpoints; clients normally use the metadata API instead.
 | PUT | `/chunks/{id}` | Cluster | Raw bytes; optional `X-Checksum` must match if supplied. Returns ID, checksum, size. |
 | GET | `/chunks/{id}` | Cluster | Raw chunk bytes and current `X-Checksum`. |
 | DELETE | `/chunks/{id}` | Cluster | Idempotently remove this node's copy. |
-| POST | `/replicate` | Cluster | JSON `chunk_id`, `source_url`, `checksum`; fetch, validate, and atomically save. |
+| POST | `/replicate` | Cluster | JSON `chunk_id`, `source_url`, `checksum`, optional `source_chunk_id`; fetch, validate, and atomically save. |
 
-`source_url` must be an HTTP(S) base URL without credentials, query, or fragment. Allowing internal replication is a privileged capability: keep nodes and cluster credentials on a trusted private network. Token checks do not replace firewall rules or TLS.
+`source_chunk_id` (default: `chunk_id`) reads a different chunk ID whose bytes are expected to be identical; the result is still saved under `chunk_id` only if it matches `checksum`. The metadata server uses this to rebuild a chunk whose every copy was lost. `source_url` must be an HTTP(S) base URL without credentials, query, or fragment. Allowing internal replication is a privileged capability: keep nodes and cluster credentials on a trusted private network. Token checks do not replace firewall rules or TLS.
 
 Heartbeat JSON contains `node_id`, `url`, `chunk_count`, `free_bytes`, and optional `restarted` (default false). The standard storage node sends `restarted=true` until its first startup registration succeeds, then false; an already-registered node enters RECOVERING on this signal even before a timeout, while a brand-new node starts ALIVE. Node identities and their registered endpoint URLs must be unique. A different ID cannot claim an endpoint already registered to another ID. Registered URLs are immutable. Reusing a node ID with a different URL returns 409; choose a new ID for a new address. A new ID does not adopt the old ID's recorded chunks. Prefer stable DNS/private addresses across restarts. `free_bytes=-1` means unknown capacity (the omitted-field default), `0` means full, and positive values report available bytes. This report is not a disk-space reservation. Actual disk writes can still fail after a heartbeat reports space.
 

@@ -239,6 +239,7 @@
   function eventWhy(message) {
     if (message.startsWith("Repair")) return "The target node pulled a copy from a healthy node and checked its SHA-256.";
     if (message.startsWith("Integrity scan")) return "Every stored copy is re-checked by the background scan every 30 s, or right away with the Check button.";
+    if (message.startsWith("Rebuilt")) return "Every copy of this chunk was lost, but another version holds a chunk with the same SHA-256, which means the same bytes. The target checked the hash before saving; repair then makes the other copies.";
     if (message.startsWith("Trim")) return "The 3 copies it keeps passed a fresh SHA-256 check first. The database row is removed before the bytes, so the map never points at a missing copy.";
     if (message.startsWith("Download")) return "Downloads check every chunk's fingerprint, so a bad copy is never sent.";
     return "Its disk no longer had a good copy, so the claim was removed before trusting the node again.";

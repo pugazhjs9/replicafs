@@ -72,6 +72,7 @@ def monitor_loop(stop: threading.Event) -> None:
                     result = replicator.verify_replicas(db, client, SCRUB_BATCH_SIZE, cursor)
                     cursor = result["next_cursor"]
                     next_scrub = time.monotonic() + SCRUB_INTERVAL
+                replicator.rebuild_lost_chunks(db, client)
                 replicator.re_replicate(db, client, REPLICATION_FACTOR)
                 replicator.trim_over_replicated(db, client, REPLICATION_FACTOR, DEAD_AFTER_SECONDS)
         except Exception:

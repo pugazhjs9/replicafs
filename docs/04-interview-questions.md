@@ -50,6 +50,10 @@ Timeout detection makes its retained placement claims untrusted. A returning hea
 
 While the node was down, repair made a replacement copy elsewhere. When the node returns with intact data, its old copy passes the recovery check, so the chunk has four live copies. The monitor then trims back to three. It reads copies on the least-loaded nodes until three pass a SHA-256 check, keeps those, and deletes the rest from the busiest disks. If three can't be proven, it deletes nothing. It removes the database row before the bytes, so metadata never points at a deleted copy. At worst a crash leaves an orphan file.
 
+## “What if every copy of a chunk is corrupt?”
+
+Normally the chunk is unavailable and downloads return 503, because nothing can invent missing bytes. One exception: the same bytes may exist under another chunk ID, for example when the same file was uploaded again as a new version. Equal SHA-256 and size means equal bytes, so the monitor asks a node to copy the twin's bytes under the lost ID. The node re-checks the hash before saving, then normal repair makes 3 copies. This is a small taste of content addressing, which deduplicating storage systems use more fully.
+
 ## “How do simultaneous uploads get different versions?”
 
 The metadata process serializes the relevant mutation and the database also has a uniqueness constraint. One worker is the supported configuration. Multiple independent coordinators would need a database-backed allocation/locking strategy and a coordinated background repair owner.

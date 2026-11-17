@@ -63,6 +63,8 @@ upgrades to existing SQLite databases without deleting their file records.
 
 `under_replicated_chunks` finds chunks with surviving sources but insufficient copies. `replication_health` also counts completely unavailable chunks for monitoring; an unavailable chunk must not disappear from the health picture just because it cannot currently be copied.
 
+`rebuild_lost_chunks` handles a chunk with no live copy at all. It looks for another chunk with the same checksum and size that still has a live copy, and asks a target to copy those bytes (`source_chunk_id`) under the lost chunk's ID. The target still verifies the checksum before saving. `pull_copy` and `record_copy` are shared with `re_replicate`: they validate the receipt and add the row only once.
+
 `re_replicate` chooses destinations that do not already hold the chunk. It retries sources and targets on failure, supplies the cluster token, and records a placement only after a valid destination response. Capacity `-1` means unknown, `0` means full, and positive reports constrain placement. It must not count an HTTP error or malformed acknowledgement as a stored copy.
 
 `trim_over_replicated` handles the opposite case: more live copies than the target, which happens when a node that was repaired around returns with intact data. It reads copies least-loaded node first until the target number pass a fresh checksum check. It keeps those and treats every other live copy as surplus. Without enough proven keepers it deletes nothing. It deletes surplus rows in a fenced transaction, then deletes the bytes. A crash in between can leave an orphan file but never a row that points at missing data.
@@ -73,7 +75,7 @@ upgrades to existing SQLite databases without deleting their file records.
 
 `get_db` gives each request its own database session and closes it afterward. Request handlers perform blocking database and HTTP work in ordinary `def` handlers, which FastAPI runs in a thread pool.
 
-Startup initializes the schema and monitor; shutdown signals the monitor to stop and closes network resources. The monitor performs health detection, bounded integrity checks, repair, and trimming of extra copies. Exceptions are logged and the loop continues; a transient error should not permanently stop self-healing.
+Startup initializes the schema and monitor; shutdown signals the monitor to stop and closes network resources. The monitor performs health detection, bounded integrity checks, rebuilds of lost chunks from identical twins, repair, and trimming of extra copies. Exceptions are logged and the loop continues; a transient error should not permanently stop self-healing.
 
 The raw request-body guard limits incoming metadata requests to `MAX_FILE_BYTES + 64 KiB`, including streamed requests without `Content-Length`, before multipart processing can spool unlimited data. The upload handler then checks the file-content limit, write policy, node selection, cleanup list, version allocation, and final commit. `attempted` keeps enough information to attempt deleting bytes from an abandoned write, including a write whose acknowledgement was lost. It cannot undo a remote write on a currently unreachable node.
 

@@ -211,6 +211,23 @@ def test_replicate_verifies_content_and_reports_receipt(client, tmp_path, monkey
     assert calls[0][2]["trust_env"] is False
 
 
+def test_replicate_can_copy_identical_bytes_from_another_chunk_id(client, tmp_path, monkeypatch):
+    calls = source_response(monkeypatch)
+    response = client.post("/replicate", json=replicate_payload(source_chunk_id="twin1"))
+    assert response.status_code == 200
+    assert response.json()["chunk_id"] == "chunk1"
+    assert calls[0][0:2] == ("GET", "http://node1:8001/chunks/twin1")
+    assert (tmp_path / "chunk1").read_bytes() == b"replica"
+    assert not (tmp_path / "twin1").exists()
+
+
+def test_replicate_from_another_chunk_id_still_requires_the_expected_checksum(client, tmp_path, monkeypatch):
+    source_response(monkeypatch, data=b"different bytes")
+    payload = replicate_payload(source_chunk_id="twin1")
+    assert client.post("/replicate", json=payload).status_code == 422
+    assert not (tmp_path / "chunk1").exists()
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -233,7 +250,10 @@ def test_replicate_rejects_invalid_source_before_network(client, monkeypatch, so
     assert calls == []
 
 
-@pytest.mark.parametrize("overrides", [{"chunk_id": "../escape"}, {"checksum": "bad"}, {"chunk_id": "é"}])
+@pytest.mark.parametrize(
+    "overrides",
+    [{"chunk_id": "../escape"}, {"checksum": "bad"}, {"chunk_id": "é"}, {"source_chunk_id": "../escape"}],
+)
 def test_replicate_validates_id_and_digest_before_network(client, monkeypatch, overrides):
     calls = source_response(monkeypatch)
     assert client.post("/replicate", json=replicate_payload(**overrides)).status_code == 422

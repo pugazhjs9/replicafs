@@ -79,6 +79,8 @@ A registered node address is immutable: changing `NODE_URL` for the same `NODE_I
 
 Reads compare SHA-256 and expected size with the metadata record. Periodic integrity checking also examines replicas even when no client downloads the file. Bad or missing placements are dropped; the repair loop copies from a healthy source.
 
+If every copy of a chunk is bad, ordinary repair has no source. The monitor then looks for a *different* chunk with the same SHA-256 and size, for example the same chunk in another version of the file. Uploading identical content again creates identical chunks under new IDs. Equal SHA-256 means equal bytes, so a target node copies that twin's bytes, checks the hash again and saves them under the lost chunk's ID. One copy is enough, and ordinary repair makes the rest. Without a twin, the chunk stays unavailable and downloads return 503.
+
 The integrity scan is bounded per pass so it does not read every stored byte on every monitor tick. Detection is eventual. Large clusters need indexed repair work queues and more advanced scanning policies.
 
 ## Delete, overwrite, restore

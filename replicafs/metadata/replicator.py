@@ -1,4 +1,4 @@
-"""Failure detection, bounded checksum scrubbing, replica repair and trimming.
+"""Failure detection, bounded checksum scrubbing, replica repair, rebuilds and trimming.
 
 Timeouts make claims untrusted; returning nodes must pass revalidation before
 ALIVE. Retained claims permit recovery after a complete outage, and copies
@@ -232,6 +232,148 @@ def replication_health(db: Session, rf: int) -> dict[str, int]:
     return health
 
 
+def alive_snapshot(db: Session) -> dict[str, SimpleNamespace]:
+    """Plain copies of ALIVE nodes, safe to use after the read transaction ends."""
+    return {
+        node.id: SimpleNamespace(
+            id=node.id, url=node.url, chunk_count=node.chunk_count, free_bytes=node.free_bytes
+        )
+        for node in db.query(Node).filter(Node.status == "ALIVE")
+    }
+
+
+def pull_copy(
+    client: httpx.Client,
+    target: SimpleNamespace,
+    source: SimpleNamespace,
+    chunk_id: str,
+    checksum: str,
+    size: int,
+    source_chunk_id: str | None = None,
+) -> bool:
+    """Ask ``target`` to fetch, verify and store a chunk; True only for a valid receipt.
+
+    A successful copy is charged to the target's local budget, so exactly
+    filling a destination never turns its remaining capacity into unknown.
+    """
+    payload = {"chunk_id": chunk_id, "source_url": source.url, "checksum": checksum}
+    if source_chunk_id is not None:
+        payload["source_chunk_id"] = source_chunk_id
+    try:
+        response = client.post(f"{target.url}/replicate", json=payload, headers=cluster_headers(), timeout=60)
+        response.raise_for_status()
+        receipt = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning("copy of chunk %s from %s to %s failed: %s", chunk_id, source.id, target.id, exc)
+        return False
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("chunk_id") != chunk_id
+        or receipt.get("checksum") != checksum
+        or receipt.get("size") != size
+    ):
+        log.warning("invalid copy receipt for chunk %s from %s", chunk_id, target.id)
+        return False
+    target.chunk_count += 1
+    if target.free_bytes >= 0:
+        target.free_bytes = max(0, target.free_bytes - size)
+    return True
+
+
+def record_copy(db: Session, alive: dict[str, SimpleNamespace], chunk_id: str, target_id: str) -> bool:
+    """Add the replica row for a verified copy, unless it is already recorded."""
+    # The single monitor avoids competing repairs; the composite key is the
+    # final duplicate guard. A repeated pass with enough copies is a no-op.
+    if db.get(Chunk, chunk_id) is None or db.get(Replica, (chunk_id, target_id)) is not None:
+        return False
+    target = db.get(Node, target_id)
+    if target is None or target.url != alive[target_id].url:
+        return False
+    db.add(Replica(chunk_id=chunk_id, node_id=target_id))
+    target.chunk_count = max(target.chunk_count, alive[target_id].chunk_count)
+    budget = alive[target_id].free_bytes
+    if budget >= 0:
+        target.free_bytes = budget if target.free_bytes == -1 else min(target.free_bytes, budget)
+    return True
+
+
+def copy_targets(alive: dict[str, SimpleNamespace], holders: set[str], size: int) -> list[SimpleNamespace]:
+    """Least-loaded ALIVE nodes without a copy that have room (-1 means unknown, 0 full)."""
+    return sorted(
+        (
+            node
+            for node in alive.values()
+            if node.id not in holders and (node.free_bytes == -1 or node.free_bytes >= size)
+        ),
+        key=lambda node: (node.chunk_count, node.id),
+    )
+
+
+def rebuild_lost_chunks(db: Session, client: httpx.Client) -> int:
+    """Recreate a chunk with no live copy from a different chunk with the same bytes.
+
+    Uploading the same content again produces identical chunks under new ids,
+    so another version may still hold bytes with the lost chunk's SHA-256 and
+    size. Equal SHA-256 means equal bytes, and the target re-checks the hash
+    before saving, so this can never store different content. One copy is
+    enough: ``re_replicate`` restores the full count from it.
+    """
+    alive = alive_snapshot(db)
+    if not alive:
+        db.rollback()
+        return 0
+    plans = []
+    for chunk in db.query(Chunk).order_by(Chunk.id):
+        if any(r.node_id in alive for r in chunk.replicas):
+            continue
+        twins = (
+            db.query(Chunk)
+            .filter(Chunk.checksum == chunk.checksum, Chunk.size == chunk.size, Chunk.id != chunk.id)
+            .order_by(Chunk.id)
+        )
+        sources = [(twin.id, r.node_id) for twin in twins for r in twin.replicas if r.node_id in alive]
+        if sources:
+            plans.append((chunk.id, chunk.checksum, chunk.size, sources))
+    db.rollback()
+
+    receipts = []
+    for chunk_id, checksum, size, sources in plans:
+        # One verified copy per pass: try each target with each twin copy until one works.
+        for target in copy_targets(alive, set(), size):
+            source = next(
+                (
+                    (twin_id, source_id)
+                    for twin_id, source_id in sources
+                    if pull_copy(client, target, alive[source_id], chunk_id, checksum, size, twin_id)
+                ),
+                None,
+            )
+            if source is not None:
+                receipts.append((chunk_id, target.id, *source))
+                log.info("rebuilt lost chunk %s on %s from twin %s", chunk_id[:8], target.id, source[0][:8])
+                break
+
+    rebuilt = 0
+    events = []
+    for chunk_id, target_id, twin_id, source_id in receipts:
+        if not record_copy(db, alive, chunk_id, target_id):
+            continue
+        rebuilt += 1
+        events.append(
+            (
+                f"Rebuilt {describe_chunk(db, chunk_id)} on {target_id} from the identical "
+                f"{describe_chunk(db, twin_id)} on {source_id} (same SHA-256)",
+                chunk_id,
+                target_id,
+            )
+        )
+    db.commit()
+    db.expire_all()
+    for message, chunk_id, node_id in events:
+        record_event("ok", message, chunk_id, node_id)
+    return rebuilt
+
+
 def re_replicate(db: Session, client: httpx.Client, rf: int) -> int:
     """Restore redundancy using alternate sources and all eligible targets.
 
@@ -239,12 +381,7 @@ def re_replicate(db: Session, client: httpx.Client, rf: int) -> int:
     Local budgets are reduced across all chunks in this pass, so exactly filling
     a destination never accidentally turns its remaining capacity into unknown.
     """
-    alive = {
-        node.id: SimpleNamespace(
-            id=node.id, url=node.url, chunk_count=node.chunk_count, free_bytes=node.free_bytes
-        )
-        for node in db.query(Node).filter(Node.status == "ALIVE")
-    }
+    alive = alive_snapshot(db)
     plans = [
         (chunk.id, chunk.checksum, chunk.size, [r.node_id for r in live])
         for chunk, live in under_replicated_chunks(db, rf)
@@ -253,61 +390,20 @@ def re_replicate(db: Session, client: httpx.Client, rf: int) -> int:
     receipts = []
     for chunk_id, checksum, size, source_ids in plans:
         holders = set(source_ids)
-        candidates = sorted(
-            (
-                node
-                for node in alive.values()
-                if node.id not in holders and (node.free_bytes == -1 or node.free_bytes >= size)
-            ),
-            key=lambda node: (node.chunk_count, node.id),
-        )
-        for target in candidates:
+        for target in copy_targets(alive, holders, size):
             if len(holders) >= rf:
                 break
             for source_id in source_ids:
-                source = alive[source_id]
-                try:
-                    response = client.post(
-                        f"{target.url}/replicate",
-                        json={"chunk_id": chunk_id, "source_url": source.url, "checksum": checksum},
-                        headers=cluster_headers(),
-                        timeout=60,
-                    )
-                    response.raise_for_status()
-                    receipt = response.json()
-                    if (
-                        not isinstance(receipt, dict)
-                        or receipt.get("chunk_id") != chunk_id
-                        or receipt.get("checksum") != checksum
-                        or receipt.get("size") != size
-                    ):
-                        log.warning("invalid repair receipt for chunk %s from %s", chunk_id, target.id)
-                        continue
-                except (httpx.HTTPError, ValueError) as exc:
-                    log.warning("repair of %s from %s to %s failed: %s", chunk_id, source.id, target.id, exc)
-                    continue
-                receipts.append((chunk_id, target.id, source.id))
-                holders.add(target.id)
-                target.chunk_count += 1
-                if target.free_bytes >= 0:
-                    target.free_bytes = max(0, target.free_bytes - size)
-                log.info("repaired chunk %s: %s -> %s", chunk_id[:8], source.id, target.id)
-                break
+                if pull_copy(client, target, alive[source_id], chunk_id, checksum, size):
+                    receipts.append((chunk_id, target.id, source_id))
+                    holders.add(target.id)
+                    log.info("repaired chunk %s: %s -> %s", chunk_id[:8], source_id, target.id)
+                    break
     fixed = 0
     events = []
     for chunk_id, target_id, source_id in receipts:
-        # The single monitor avoids competing repairs; the composite key is the
-        # final duplicate guard. A repeated pass with enough copies is a no-op.
-        if db.get(Chunk, chunk_id) is None or db.get(Replica, (chunk_id, target_id)) is not None:
+        if not record_copy(db, alive, chunk_id, target_id):
             continue
-        target = db.get(Node, target_id)
-        if target is None or target.url != alive[target_id].url:
-            continue
-        db.add(Replica(chunk_id=chunk_id, node_id=target_id))
-        target.chunk_count = max(target.chunk_count, alive[target_id].chunk_count)
-        budget = alive[target_id].free_bytes
-        if budget >= 0:
-            target.free_bytes = budget if target.free_bytes == -1 else min(target.free_bytes, budget)
         fixed += 1
         events.append(
             (

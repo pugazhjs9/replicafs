@@ -734,3 +734,120 @@ def test_trim_forgets_the_copy_before_deleting_bytes_and_tolerates_a_failed_dele
     assert seen == [0]
     assert {row.node_id for row in db.query(Replica)} == {"a", "b", "c"}
     assert len(replicator.events_after(start)["events"]) == 1
+
+
+def copy_receipt(request):
+    import json
+
+    payload = json.loads(request.content)
+    return response_for(
+        request, json={"chunk_id": payload["chunk_id"], "checksum": CHECKSUM, "size": len(DATA)}
+    )
+
+
+def test_lost_chunk_is_rebuilt_from_an_identical_twin_then_fully_repaired(db):
+    for name in ("a", "b", "c", "d"):
+        add_node(db, name)
+    add_chunk(db, "lost", holders=())
+    add_chunk(db, "twin", holders=("b", "c", "d"))
+    assert replicator.replication_health(db, 3)["unavailable_chunks"] == 1
+    payloads = []
+
+    def handler(request):
+        import json
+
+        payloads.append((request.url.host, json.loads(request.content)))
+        return copy_receipt(request)
+
+    start = replicator.events_after(0)["latest"]
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert replicator.rebuild_lost_chunks(db, client) == 1
+        assert replicator.rebuild_lost_chunks(db, client) == 0
+        assert replicator.re_replicate(db, client, 3) == 2
+    # The target saves the twin's bytes under the lost chunk's own id.
+    assert payloads[0] == (
+        "a",
+        {"chunk_id": "lost", "source_url": "http://b:8001", "checksum": CHECKSUM, "source_chunk_id": "twin"},
+    )
+    assert all("source_chunk_id" not in payload for _, payload in payloads[1:])
+    assert db.query(Replica).filter(Replica.chunk_id == "lost").count() == 3
+    assert replicator.replication_health(db, 3)["unavailable_chunks"] == 0
+    rebuilt = replicator.events_after(start)["events"][0]
+    assert (rebuilt["kind"], rebuilt["chunk_id"], rebuilt["node_id"]) == ("ok", "lost", "a")
+    assert rebuilt["message"] == (
+        "Rebuilt chunk 0 of lost.bin (v1) on a from the identical chunk 0 of twin.bin (v1) on b (same SHA-256)"
+    )
+
+
+def test_no_rebuild_without_a_live_twin_with_the_same_bytes(db):
+    add_node(db, "a")
+    add_node(db, "dead", status="DEAD")
+    add_node(db, "returning", status="RECOVERING")
+    add_chunk(db, "lost", holders=())
+    add_chunk(db, "untrusted-twin", holders=("dead", "returning"))
+    different = add_chunk(db, "different", holders=("a",))
+    different.checksum = sha256_hex(b"other bytes")
+    db.commit()
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda req: pytest.fail("no source may be used"))
+    ) as client:
+        assert replicator.rebuild_lost_chunks(db, client) == 0
+    assert db.query(Replica).filter(Replica.chunk_id == "lost").count() == 0
+
+
+def test_rebuild_skips_a_corrupt_twin_copy_and_uses_the_next(db):
+    for name in ("a", "b", "target"):
+        add_node(db, name, chunk_count=5)
+    db.get(Node, "target").chunk_count = 0
+    db.commit()
+    add_chunk(db, "lost", holders=())
+    add_chunk(db, "twin", holders=("a", "b"))
+    sources = []
+
+    def handler(request):
+        import json
+
+        source = json.loads(request.content)["source_url"]
+        sources.append(source)
+        return response_for(request, 422) if "//a:" in source else copy_receipt(request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert replicator.rebuild_lost_chunks(db, client) == 1
+    assert sources == ["http://a:8001", "http://b:8001"]
+    assert {row.node_id for row in db.query(Replica).filter(Replica.chunk_id == "lost")} == {"target"}
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [{"chunk_id": "twin", "checksum": CHECKSUM, "size": 16}, {"chunk_id": "lost", "checksum": "0" * 64}],
+)
+def test_rebuild_with_an_invalid_receipt_records_nothing(db, receipt):
+    add_node(db, "a")
+    add_chunk(db, "lost", holders=())
+    add_chunk(db, "twin", holders=("a",))
+    with httpx.Client(transport=httpx.MockTransport(lambda req: response_for(req, json=receipt))) as client:
+        assert replicator.rebuild_lost_chunks(db, client) == 0
+    assert db.query(Replica).filter(Replica.chunk_id == "lost").count() == 0
+
+
+def test_rebuild_with_no_alive_nodes_does_nothing(db):
+    add_node(db, "dead", status="DEAD")
+    add_chunk(db, "lost", holders=("dead",))
+    with httpx.Client(transport=httpx.MockTransport(lambda req: pytest.fail("no node is alive"))) as client:
+        assert replicator.rebuild_lost_chunks(db, client) == 0
+
+
+def test_copy_recorded_concurrently_is_not_counted_twice(db):
+    add_node(db, "a")
+    add_chunk(db, "lost", holders=())
+    add_chunk(db, "twin", holders=("a",))
+
+    def handler(request):
+        # Another pass records the same copy while this HTTP copy is in flight.
+        db.add(Replica(chunk_id="lost", node_id="a"))
+        db.commit()
+        return copy_receipt(request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert replicator.rebuild_lost_chunks(db, client) == 0
+    assert db.query(Replica).filter(Replica.chunk_id == "lost").count() == 1

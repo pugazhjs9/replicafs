@@ -191,11 +191,13 @@ class ReplicateRequest(BaseModel):
     chunk_id: str
     source_url: str
     checksum: str
+    # Read a different chunk id with identical bytes; saved under chunk_id.
+    source_chunk_id: str | None = None
 
-    @field_validator("chunk_id")
+    @field_validator("chunk_id", "source_chunk_id")
     @classmethod
-    def valid_chunk_id(cls, value: str) -> str:
-        if not CHUNK_ID.fullmatch(value):
+    def valid_chunk_id(cls, value: str | None) -> str | None:
+        if value is not None and not CHUNK_ID.fullmatch(value):
             raise ValueError("invalid chunk id")
         return value
 
@@ -234,13 +236,17 @@ class ReplicateRequest(BaseModel):
 
 @app.post("/replicate", dependencies=INTERNAL)
 def replicate(req: ReplicateRequest):
-    """Pull and verify a bounded chunk from a source selected by metadata."""
+    """Pull and verify a bounded chunk from a source selected by metadata.
+
+    The bytes must hash to ``checksum`` whichever id they were read from, so
+    copying from an identical chunk can never store different content.
+    """
     path = chunk_path(req.chunk_id)
     data = bytearray()
     try:
         with httpx.stream(
             "GET",
-            f"{req.source_url}/chunks/{req.chunk_id}",
+            f"{req.source_url}/chunks/{req.source_chunk_id or req.chunk_id}",
             headers=cluster_headers(),
             timeout=30,
             trust_env=False,

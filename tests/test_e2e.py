@@ -521,6 +521,27 @@ def test_all_copies_corrupt_returns_json_503_before_streaming(cluster):
     assert cluster.cluster()["under_replicated_chunks"] == 1
 
 
+def test_chunk_with_every_copy_corrupt_is_rebuilt_from_an_identical_version(cluster):
+    data = os.urandom(CHUNK_SIZE + 5)
+    cluster.upload("twin.bin", data)
+    cluster.upload("twin.bin", data)
+    with closing(sqlite3.connect(cluster.database, timeout=5)) as connection:
+        damaged = connection.execute(
+            "SELECT c.id, r.node_id FROM chunks c JOIN files f ON f.id = c.file_id "
+            'JOIN replicas r ON r.chunk_id = c.id WHERE f.name = ? AND f.version = 2 AND c."index" = 0',
+            ("twin.bin",),
+        ).fetchall()
+    assert len(damaged) == 3
+    for chunk_id, node in damaged:
+        (cluster.node_data_dir(node) / chunk_id).write_bytes(b"corrupt")
+    # Only version 1's identical chunk can supply these bytes again.
+    cluster.wait(lambda: cluster.replicas_valid("twin.bin"), 20, "lost chunk rebuilt and fully replicated")
+    assert cluster.cluster()["unavailable_chunks"] == 0
+    assert cluster.download("twin.bin", version=2).content == data
+    messages = [event["message"] for event in cluster.request("GET", "/events").json()["events"]]
+    assert any(message.startswith("Rebuilt chunk 0 of twin.bin (v2)") for message in messages)
+
+
 def test_read_falls_back_before_failed_node_heartbeat_expires(cluster):
     data = os.urandom(CHUNK_SIZE)
     cluster.upload("fast-fallback.bin", data)
