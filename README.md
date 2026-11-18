@@ -27,6 +27,8 @@ Three copies per chunk is the default target. Four storage nodes in the demo pro
 
 **New to the subject?** Read [the beginner learning path](docs/00-START-HERE.md). It explains the words, the code, the commands, and what to say in a project presentation.
 
+**Want the story behind it?** Read the blog post [I Built a Small Google File System in Python, Then Tried to Break It](docs/blog/README.md). It covers why I built ReplicaFS, what it borrows from the Google File System paper, and the two bugs my own demos found.
+
 You need Git, Docker with Compose, and `curl` for this route:
 
 ```bash
