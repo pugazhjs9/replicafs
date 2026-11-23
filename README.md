@@ -110,9 +110,11 @@ python -m pytest -v
 
 Tests include isolated unit/API cases and a real five-process cluster. The integration tests use temporary directories and random local ports. See [test strategy and case coverage](docs/07-testing.md) for commands, the scenario matrix, and what the tests cannot prove. Passing a finite test suite does not establish that every possible failure has been tested.
 
-The [verification record](docs/10-verification.md) captures **298 passing tests**,
-**95.7% combined coverage**, the Docker failover proof and the native-launcher
-restart exercise, with the tested revision and environment.
+The full suite currently has **333 passing tests** with **97.9% combined
+statement/branch coverage** (run on 2026-11-23). The
+[verification record](docs/10-verification.md) documents an earlier run
+(298 tests, 95.7%), the Docker failover proof and the native-launcher restart
+exercise, with the tested revision and environment.
 
 ## Repository map
 

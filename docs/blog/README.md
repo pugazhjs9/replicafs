@@ -20,6 +20,20 @@ In the same internship I stored files in Amazon S3, and I never once wondered wh
 
 I was comfortable building APIs, but I'd never built anything that had to keep working while its own machines failed. That's what I wanted to learn, so that's what I built.
 
+## The problem, and what I set out to build
+
+The problem is easy to state. A file that lives on one machine is only as safe as that machine. If the disk dies, the file is gone. If the disk hands back slightly wrong bytes without reporting an error, the file is damaged, and nobody finds out until they open it.
+
+My project brief was a fault-tolerant file store that could run on free-tier cloud machines, the kind of small, cheap servers you can't expect to stay up forever. Before writing any code, I wrote down what it had to do:
+
+- keep every file downloadable when a storage server dies
+- notice a dead server by itself, with nobody watching
+- make new copies of anything that was lost
+- catch corrupted data, both when a file is downloaded and long before anyone asks for it
+- prove that every download is exactly the bytes that were uploaded
+
+I built it in Python 3.13. Both kinds of server are FastAPI apps run by Uvicorn, the metadata lives in SQLite (through SQLAlchemy), and the servers talk to each other over HTTP using httpx. Every chunk and every file gets a SHA-256 checksum. Docker Compose runs the whole cluster, five servers, on one laptop, and the dashboard is a single page of plain HTML and JavaScript. The tests use pytest, and GitHub Actions runs them on every push.
+
 Most of the design comes from a paper Google published in 2003. The rest came from bugs.
 
 ## Starting from the GFS paper
@@ -139,7 +153,7 @@ Disks sometimes hand back the wrong bytes without reporting an error. If nobody 
 
 GFS chunkservers "scan and verify the contents of inactive chunks" during idle periods. ReplicaFS has a scrubber that does the same job from the metadata server. Every 30 seconds it reads the next 100 stored copies, hashes each one, and drops any copy whose hash is wrong. The normal repair step then replaces it from a good copy.
 
-To demo this, I damage a copy by hand: I use `docker compose exec` to write junk into a chunk file inside a node's container. Within 30 seconds the scrubber catches it and repair puts a good copy back.
+To demo this, I damage a copy by hand: I use `docker compose exec` to write junk into a chunk file inside a node's container. The scrubber reaches that copy within about a minute, or right away if I click **Check all copies now** on the dashboard, and repair puts a good copy back.
 
 The first time I tried this in front of the dashboard, it showed nothing at all. The scrubber found the bad copy and the repair finished between two refreshes of the page, so as far as the screen was concerned, nothing had happened. That's why the dashboard has an activity feed now. Without it, the system fixed things too fast for me to prove it had fixed anything.
 
@@ -180,6 +194,16 @@ Bugs in distributed systems hide in timing, so I didn't want to rely on unit tes
 A test that passes even when the feature is broken is worse than no test, because it gives you confidence you haven't earned. So for the trimming and rebuild tests, I turned the feature off, watched the test fail, and turned it back on.
 
 There's more test code than application code: about 3,250 lines of tests next to 1,710 lines of Python. A lot of it is about timing. Two uploads with the same file name race each other for the next version number. Two repairs record the same new copy at once. A node restarts with an empty disk so quickly that it's never even marked DEAD. The end-to-end suite takes about a minute on my laptop, and GitHub Actions runs everything on Python 3.12 and 3.13 on every push.
+
+## Where it ended up
+
+Here's where ReplicaFS stands, against the list I started with:
+
+- Stopping a storage node loses nothing. In the measured run it was marked DEAD after 9 seconds, and every chunk was back to three copies 4 seconds later.
+- Downloads kept working through the failure, and every download is checked against its SHA-256 before the first byte is sent.
+- A damaged copy is caught by the scrubber, or by the next download that reads it, and replaced from a good copy.
+- A node that comes back is checked before it's trusted again, and the extra copies it brings back are trimmed.
+- 333 tests with 97.9% line coverage, including 20 end-to-end tests that break real processes on purpose.
 
 ## Where I took shortcuts
 
